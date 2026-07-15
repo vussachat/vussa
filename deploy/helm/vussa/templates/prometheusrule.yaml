@@ -1,0 +1,28 @@
+{{- if .Values.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "vussa.fullname" . }}
+  labels:
+    {{- toYaml .Values.prometheusRule.labels | nindent 4 }}
+spec:
+  groups:
+    - name: {{ include "vussa.fullname" . }}.availability
+      rules:
+        - alert: {{ include "vussa.fullname" . }}BackendUnavailable
+          expr: sum(up{app_kubernetes_io_name={{ printf "%q" (include "vussa.name" .) }},app_kubernetes_io_instance={{ printf "%q" .Release.Name }}}) < {{ .Values.replicaCount }}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Backend replicas are unavailable
+            description: Fewer backend instances are reporting healthy metrics than configured.
+        - alert: {{ include "vussa.fullname" . }}WebSocketCapacity
+          expr: sum(vussa_active_websockets) > 10000
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: WebSocket connection volume is high
+            description: Review capacity and autoscaling before connection saturation.
+{{- end }}

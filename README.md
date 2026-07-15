@@ -90,16 +90,68 @@ The web application supports registration, login, logout, profile updates, cooki
 The development wrapper enables deterministic test fixtures on every start: `test1` through `test6` use matching passwords (`test1:test1`, ..., `test6:test6`), and `test1` has the admin role. These predictable accounts are intentionally enabled only by the wrapper’s `SEED_TEST_ACCOUNTS=true` setting and must not be enabled in production.
 
 Operational endpoints are `/api/v1/health/live`, `/api/v1/health/ready`, `/api/v1/health/startup`, and `/api/v1/metrics`. PostgreSQL and Valkey are required for readiness. The application uses PostgreSQL as the durable source of truth and a transactional outbox for authorization/session invalidation events.
+Cookie-authenticated WebSocket upgrades enforce the configured `CORS_ORIGIN`,
+or the request host when no explicit origin is configured; non-browser clients
+without an `Origin` header remain supported.
 
 Production Kubernetes resources are in `deploy/helm/vussa`. The chart expects externally managed PostgreSQL 18 and Valkey URLs by default:
 
 ```sh
 helm install vussa ./deploy/helm/vussa \
   --set postgres.url='postgres://user:password@postgres.example/vussa' \
-  --set valkey.url='redis://valkey.example:6379'
+  --set valkey.url='redis://valkey.example:6379' \
+  --set storage.backend=s3 \
+  --set storage.endpoint='https://s3.example' \
+  --set storage.bucket='vussa-files'
 ```
 
+The chart defaults to shared S3-compatible object storage and disables the
+local upload volume because multiple replicas must observe the same files.
+Filesystem storage is available for single-replica development deployments;
+the chart rejects it when more than one replica is configured. Keep storage
+credentials in the referenced external Secret rather than in chart values.
+Topology spreading defaults to `DoNotSchedule` so production replicas stay
+separated by hostname and zone; single-node development clusters can explicitly
+set `topologySpread.whenUnsatisfiable=ScheduleAnyway`.
+The backend and frontend workloads do not require Kubernetes API access, so
+their service-account token automounting is disabled by the chart.
+Build and publish both images before installing the chart:
+
+```sh
+docker build -t registry.example/vussa:latest .
+docker build -f frontend/Dockerfile -t registry.example/vussa-frontend:latest frontend
+```
+
+Set `image.repository` and `frontend.image.repository` to those image names.
+Keep the chart’s `cookieSecure` default enabled behind HTTPS; disposable
+HTTP-only port-forward smoke tests must explicitly set `--set cookieSecure=false`.
+Set `notifications.vapidPublicKey` when enabling native browser push; the
+private signing and delivery credentials belong to the configured browser
+notification adapter and should remain in the external Secret.
+
 PostgreSQL 18 asynchronous I/O is configured by the PostgreSQL operator. Use `io_method=io_uring` only when the node/container seccomp policy permits it; `worker` is the portable Kubernetes fallback.
+
+The optional Helm restore Job is fail-closed: set
+`restore.allowDestructive=true` only during an explicitly approved recovery,
+because it runs `pg_restore --clean` against the configured database. The
+disposable backup/restore smoke test restores into a separate database instead.
+
+The operational smoke checks are `scripts/integration-smoke.sh` (auth, files,
+WebSocket upgrade, recovery, drafts, and sessions),
+`scripts/dependency-failure-smoke.sh` (cache outage and recovery), and
+`scripts/ha-smoke.sh` (replica replacement and rolling restart). The disposable
+Kubernetes checks are `scripts/kubernetes-dependency-smoke.sh` (Valkey outage),
+`scripts/kubernetes-database-dependency-smoke.sh` (PostgreSQL outage), and
+`scripts/kubernetes-backup-restore-smoke.sh` plus
+`scripts/kubernetes-node-failure-smoke.sh` (single-node failure) and
+`scripts/kubernetes-zone-failure-smoke.sh` (all workers in one labeled zone).
+The node and zone checks control disposable kind node containers and must only
+be run in an isolated test cluster. CI runs these against a kind
+cluster with disposable dependencies; production deployments should use
+operator-managed, multi-zone PostgreSQL and Valkey services and run the same
+checks against those services before sign-off. The application uses a
+transactional outbox with expiring claims so multiple replicas do not normally
+claim the same event; delivery remains at-least-once for crash recovery.
 
 ## License
 MIT or Apache 2.0

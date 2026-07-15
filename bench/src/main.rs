@@ -1011,6 +1011,7 @@ async fn run_api_workload(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn user_loop(
     args: Args,
     metrics: Arc<Metrics>,

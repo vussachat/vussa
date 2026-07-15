@@ -6,10 +6,11 @@
     "dev": "vite dev",
     "build": "vite build",
     "preview": "vite preview",
+    "test": "node --test tests/*.test.js",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
   },
   "devDependencies": {
-    "@sveltejs/adapter-auto": "latest",
+    "@sveltejs/adapter-node": "^5.5.7",
     "@sveltejs/kit": "latest",
     "@sveltejs/vite-plugin-svelte": "latest",
     "svelte": "latest",

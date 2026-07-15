@@ -1,0 +1,15 @@
+{{- if .Values.frontend.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "vussa.fullname" . }}-frontend
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: {{ include "vussa.name" . }}-frontend
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: http
+      port: {{ .Values.frontend.service.port }}
+      targetPort: http
+{{- end }}

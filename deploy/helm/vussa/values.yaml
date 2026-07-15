@@ -1,4 +1,24 @@
 replicaCount: 2
+topologySpread:
+  # Production keeps replicas on separate hosts/zones. Override only for
+  # deliberately single-node development clusters.
+  whenUnsatisfiable: DoNotSchedule
+frontend:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: vussa-frontend
+    tag: latest
+    pullPolicy: IfNotPresent
+  service:
+    port: 3000
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
 image:
   repository: vussa
   tag: latest
@@ -6,7 +26,19 @@ image:
 service:
   type: ClusterIP
   port: 3000
-resources: {}
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: chat.example.com
+  tls: []
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
 podDisruptionBudget:
   enabled: true
   minAvailable: 1
@@ -19,6 +51,25 @@ postgres:
   url: ""
 valkey:
   url: ""
+storage:
+  # Shared object storage is required when replicaCount is greater than one.
+  backend: s3
+  endpoint: ""
+  bucket: ""
+  region: us-east-1
+  accessKey: ""
+  secretKey: ""
+fileScanner:
+  url: ""
+recovery:
+  webhookUrl: ""
+notifications:
+  emailUrl: ""
+  browserUrl: ""
+  vapidPublicKey: ""
+externalSecret:
+  # Set this to a pre-created Secret managed by an operator such as ESO.
+  name: ""
 admin:
   email: ""
   password: ""
@@ -29,11 +80,40 @@ securityContext:
     drop: [ALL]
   seccompProfile:
     type: RuntimeDefault
+corsOrigin: ""
+cookieSecure: true
 podSecurityContext:
   fsGroup: 10001
 serviceMonitor:
   enabled: false
   interval: 15s
+prometheusRule:
+  enabled: false
+  labels: {}
+networkPolicy:
+  enabled: false
+persistence:
+  enabled: false
+  accessModes: [ReadWriteMany]
+  storageClass: ""
+  size: 10Gi
+backup:
+  enabled: false
+  schedule: "0 2 * * *"
+  image: postgres:18
+  size: 50Gi
+  storageClass: ""
+  retentionDays: 14
+restore:
+  enabled: false
+  image: postgres:18
+  backupFile: ""
+  # Restoring into the configured database is destructive and must be
+  # explicitly acknowledged for a production recovery operation.
+  allowDestructive: false
+migration:
+  enabled: false
+  image: ""
 io:
   # PostgreSQL operator setting; this application chart does not manage external PostgreSQL.
   method: worker

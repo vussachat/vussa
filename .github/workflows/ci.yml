@@ -1,0 +1,181 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: vussa_chat
+          POSTGRES_PASSWORD: vussa_chat
+          POSTGRES_DB: vussa_chat
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd="pg_isready -U vussa_chat -d vussa_chat"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+      valkey:
+        image: valkey/valkey:8
+        ports: ["6379:6379"]
+    env:
+      DATABASE_URL: postgres://vussa_chat:vussa_chat@localhost:5432/vussa_chat
+      VALKEY_URL: redis://localhost:6379
+      ADMIN_EMAIL: ci-admin@example.com
+      ADMIN_PASSWORD: ci-admin-password-2026
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-targets
+      - run: bash -n scripts/*.sh
+      - run: |
+          ! rg -n -F '\${' scripts --glob '*.sh'
+      - run: python3 -m py_compile scripts/*.py
+      - run: chmod +x scripts/integration-smoke.sh && START_SERVER=true scripts/integration-smoke.sh
+      - name: Run disposable capacity smoke
+        run: |
+          SEED_TEST_ACCOUNTS=true BIND_ADDRESS=127.0.0.1:3300 cargo run --quiet --package vussa > /tmp/vussa-capacity.log 2>&1 &
+          server_pid=$!
+          cleanup() { kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; }
+          trap cleanup EXIT
+          for attempt in {1..60}; do
+            curl --fail --silent http://127.0.0.1:3300/api/v1/health/ready >/dev/null && break
+            sleep 1
+          done
+          cargo run --quiet --package vussa-bench -- \
+            --mode readonly --concurrency 2 --duration 1 --warmup 0 \
+            --nofile-limit 1024 --output /tmp/vussa-bench.json
+          python3 -c 'import json; report=json.load(open("/tmp/vussa-bench.json")); assert report["passed"] and report["authenticated_clients"] == 2'
+      - run: MIGRATIONS_ONLY=true cargo run --quiet --package vussa
+      - run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -Atc "
+            SELECT 1 FROM information_schema.columns
+              WHERE table_name='messages' AND column_name='metadata';
+            SELECT 1 FROM information_schema.columns
+              WHERE table_name='messages' AND column_name='mentions';
+            SELECT 1 FROM information_schema.columns
+              WHERE table_name='messages' AND column_name='search_vector';
+            SELECT 1 FROM pg_indexes
+              WHERE tablename='messages' AND indexname='messages_search_vector_idx';
+            SELECT 1 FROM pg_indexes
+              WHERE tablename='messages' AND indexname='messages_mentions_idx';
+          " | grep -c '^1$' | grep -q '^5$'
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - run: npm run check
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend
+      - run: npm test
+        working-directory: frontend
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint deploy/helm/vussa --set postgres.url=postgres://ci --set valkey.url=redis://ci
+      - run: helm template vussa deploy/helm/vussa --set postgres.url=postgres://ci --set valkey.url=redis://ci > /tmp/vussa.yaml
+      - run: |
+          grep -q 'kind: Deployment' /tmp/vussa.yaml
+          grep -q 'kind: Service' /tmp/vussa.yaml
+          grep -q 'kind: PodDisruptionBudget' /tmp/vussa.yaml
+          grep -q 'kind: HorizontalPodAutoscaler' /tmp/vussa.yaml
+          grep -q 'maxUnavailable: 0' /tmp/vussa.yaml
+          grep -q 'topology.kubernetes.io/zone' /tmp/vussa.yaml
+          grep -q 'terminationGracePeriodSeconds: 30' /tmp/vussa.yaml
+          grep -q 'automountServiceAccountToken: false' /tmp/vussa.yaml
+      - run: helm template vussa deploy/helm/vussa --set postgres.url=postgres://ci --set valkey.url=redis://ci --set backup.enabled=true > /tmp/vussa-backup.yaml
+      - run: helm template vussa deploy/helm/vussa --set postgres.url=postgres://ci --set valkey.url=redis://ci --set restore.enabled=true --set restore.backupFile=restore.dump --set restore.allowDestructive=true > /tmp/vussa-restore.yaml
+      - run: |
+          grep -q 'mountPath: /backup' /tmp/vussa-restore.yaml
+          grep -q 'claimName: vussa-vussa-backups' /tmp/vussa-restore.yaml
+      - run: helm template vussa deploy/helm/vussa --set postgres.url=postgres://ci --set valkey.url=redis://ci --set restore.enabled=true --set restore.backupFile=restore.dump > /tmp/vussa-restore-guarded.yaml
+      - run: "grep -A1 'name: ALLOW_DESTRUCTIVE_RESTORE' /tmp/vussa-restore-guarded.yaml | grep -q 'value: \"false\"'"
+      - run: helm template vussa deploy/helm/vussa --set postgres.url=postgres://ci --set valkey.url=redis://ci --set migration.enabled=true > /tmp/vussa-migration.yaml
+      - run: helm template vussa deploy/helm/vussa --set postgres.url=postgres://ci --set valkey.url=redis://ci --set ingress.enabled=true > /tmp/vussa-ingress.yaml
+      - run: helm template vussa deploy/helm/vussa --set postgres.url=postgres://ci --set valkey.url=redis://ci --set networkPolicy.enabled=true > /tmp/vussa-networkpolicy.yaml
+      - run: helm template vussa deploy/helm/vussa --set postgres.url=postgres://ci --set valkey.url=redis://ci --set prometheusRule.enabled=true > /tmp/vussa-prometheus.yaml
+      - run: "grep -q 'kind: PrometheusRule' /tmp/vussa-prometheus.yaml"
+      - run: helm template vussa deploy/helm/vussa --set postgres.url=postgres://ci --set valkey.url=redis://ci --set serviceMonitor.enabled=true > /tmp/vussa-servicemonitor.yaml
+      - run: "grep -q 'kind: ServiceMonitor' /tmp/vussa-servicemonitor.yaml"
+      - run: '! helm template vussa deploy/helm/vussa --set postgres.url=postgres://ci --set valkey.url=redis://ci --set storage.backend=filesystem'
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose config
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: vussa:ci
+      - run: docker build -f frontend/Dockerfile -t vussa-frontend:ci frontend
+      - run: chmod +x scripts/dependency-failure-smoke.sh && scripts/dependency-failure-smoke.sh
+
+  kubernetes-ha:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: helm/kind-action@v1.12.0
+        with:
+          cluster_name: vussa-ci
+          config: deploy/ha-smoke/kind-config.yaml
+      - uses: azure/setup-helm@v4
+      - run: |
+          kubectl label node vussa-ci-worker topology.kubernetes.io/zone=zone-a --overwrite
+          kubectl label node vussa-ci-worker2 topology.kubernetes.io/zone=zone-b --overwrite
+          kubectl label node vussa-ci-worker3 topology.kubernetes.io/zone=zone-c --overwrite
+      - run: docker build -t vussa:ci .
+      - run: docker build -f frontend/Dockerfile -t vussa-frontend:ci frontend
+      - run: kind load docker-image vussa:ci vussa-frontend:ci --name vussa-ci
+      - run: kubectl apply -f deploy/ha-smoke/dependencies.yaml
+      - run: kubectl wait --for=condition=available deployment/postgres deployment/valkey deployment/minio --timeout=180s
+      - run: kubectl wait --for=condition=complete job/minio-create-bucket --timeout=180s
+      - run: >-
+          helm upgrade --install vussa deploy/helm/vussa
+          --set image.repository=vussa --set image.tag=ci
+          --set frontend.image.repository=vussa-frontend --set frontend.image.tag=ci
+          --set cookieSecure=false
+          --set postgres.url=postgres://vussa_chat:vussa_chat@postgres:5432/vussa_chat
+          --set valkey.url=redis://valkey:6379
+          --set admin.email=ci-admin@example.com --set admin.password=ci-admin-password-2026
+          --set migration.enabled=true
+          --set storage.backend=s3 --set storage.endpoint=http://minio:9000
+          --set storage.bucket=vussa --set storage.accessKey=minio
+          --set storage.secretKey=minio123456 --wait --timeout 5m
+      - run: chmod +x scripts/kubernetes-dependency-smoke.sh scripts/kubernetes-database-dependency-smoke.sh scripts/kubernetes-backup-restore-smoke.sh scripts/kubernetes-node-failure-smoke.sh scripts/kubernetes-zone-failure-smoke.sh scripts/ha-smoke.sh scripts/integration-smoke.sh scripts/websocket-smoke.py
+      - run: NAMESPACE=default SERVICE=vussa-vussa ADMIN_EMAIL=ci-admin@example.com ADMIN_PASSWORD=ci-admin-password-2026 scripts/kubernetes-dependency-smoke.sh
+      - run: NAMESPACE=default SERVICE=vussa-vussa ADMIN_EMAIL=ci-admin@example.com ADMIN_PASSWORD=ci-admin-password-2026 scripts/kubernetes-database-dependency-smoke.sh
+      - run: NAMESPACE=default RELEASE=vussa ADMIN_EMAIL=ci-admin@example.com ADMIN_PASSWORD=ci-admin-password-2026 scripts/ha-smoke.sh
+      - run: |
+          docker build -t vussa:ci-upgrade .
+          kind load docker-image vussa:ci-upgrade --name vussa-ci
+          helm upgrade vussa deploy/helm/vussa --reuse-values \
+            --set image.tag=ci-upgrade --wait --timeout 5m
+          kubectl rollout status deployment/vussa-vussa --timeout=180s
+          kubectl run vussa-upgrade-probe-$(date +%s) --rm --restart=Never --attach --quiet \
+            --image=curlimages/curl:8.10.1 -- \
+            curl --fail --retry 20 --retry-delay 2 http://vussa-vussa/api/v1/health/ready
+      - run: NAMESPACE=default DEPLOYMENT=vussa-vussa SERVICE=vussa-vussa scripts/kubernetes-node-failure-smoke.sh
+      - run: NAMESPACE=default RELEASE=vussa DEPLOYMENT=vussa-vussa SERVICE=vussa-vussa ZONE=zone-a scripts/kubernetes-zone-failure-smoke.sh
+      - run: NAMESPACE=default scripts/kubernetes-backup-restore-smoke.sh

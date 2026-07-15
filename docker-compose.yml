@@ -1,4 +1,26 @@
 services:
+  app:
+    build:
+      context: .
+    ports:
+      - "${VUSSA_APP_PORT:-3000}:3000"
+    environment:
+      BIND_ADDRESS: 0.0.0.0:3000
+      DATABASE_URL: postgres://vussa_chat:vussa_chat@postgres:5432/vussa_chat
+      VALKEY_URL: redis://valkey:6379
+      UPLOAD_DIR: /data/uploads
+    volumes:
+      - uploads-data:/data/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1:3000/api/v1/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
   valkey:
     image: valkey/valkey:9.1.0
     ports:
@@ -27,3 +49,4 @@ services:
 
 volumes:
   postgres-data:
+  uploads-data:

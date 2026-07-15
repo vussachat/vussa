@@ -1,0 +1,98 @@
+{{- if or .Values.backup.enabled .Values.restore.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "vussa.fullname" . }}-backups
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- if .Values.backup.storageClass }}
+  storageClassName: {{ .Values.backup.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.backup.size }}
+{{- if .Values.backup.enabled }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "vussa.fullname" . }}-backup
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: {{ include "vussa.fullname" . }}
+          restartPolicy: OnFailure
+          securityContext: {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: postgres-backup
+              image: {{ .Values.backup.image | quote }}
+              envFrom:
+                - secretRef:
+                    name: {{ default (include "vussa.fullname" .) .Values.externalSecret.name }}
+              env:
+                - name: RETENTION_DAYS
+                  value: {{ .Values.backup.retentionDays | quote }}
+              command: ["/bin/sh", "-ec"]
+              args:
+                - >-
+                  mkdir -p /backup;
+                  pg_dump --format=custom --no-owner "$DATABASE_URL"
+                  > "/backup/vussa-$(date -u +%Y%m%dT%H%M%SZ).dump";
+                  find /backup -type f -name '*.dump' -mtime +"$RETENTION_DAYS" -delete
+              securityContext: {{- toYaml .Values.securityContext | nindent 16 }}
+              volumeMounts:
+                - name: backup
+                  mountPath: /backup
+          volumes:
+            - name: backup
+              persistentVolumeClaim:
+                claimName: {{ include "vussa.fullname" . }}-backups
+{{- end }}
+{{- if .Values.restore.enabled }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "vussa.fullname" . }}-restore
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      serviceAccountName: {{ include "vussa.fullname" . }}
+      restartPolicy: Never
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: postgres-restore
+          image: {{ .Values.restore.image | quote }}
+          envFrom:
+            - secretRef:
+                name: {{ default (include "vussa.fullname" .) .Values.externalSecret.name }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - >-
+              test "$ALLOW_DESTRUCTIVE_RESTORE" = "true";
+              test -n "$BACKUP_FILE";
+              test -f "/backup/$BACKUP_FILE";
+              pg_restore --clean --if-exists --no-owner --exit-on-error
+              --dbname="$DATABASE_URL" "/backup/$BACKUP_FILE"
+          env:
+            - name: BACKUP_FILE
+              value: {{ required "restore.backupFile is required when restore.enabled is true" .Values.restore.backupFile | quote }}
+            - name: ALLOW_DESTRUCTIVE_RESTORE
+              value: {{ .Values.restore.allowDestructive | quote }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: backup
+              mountPath: /backup
+      volumes:
+        - name: backup
+          persistentVolumeClaim:
+            claimName: {{ include "vussa.fullname" . }}-backups
+{{- end }}
+{{- end }}

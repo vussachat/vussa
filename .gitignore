@@ -3,6 +3,8 @@ frontend/node_modules
 frontend/.svelte-kit
 frontend/build
 frontend/.vite
+__pycache__/
+*.py[cod]
 .dev
 .bench
 plan.txt

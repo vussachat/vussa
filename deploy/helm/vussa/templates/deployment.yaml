@@ -1,3 +1,6 @@
+{{- if and (gt (int .Values.replicaCount) 1) (eq .Values.storage.backend "filesystem") }}
+{{- fail "storage.backend=filesystem is incompatible with multiple replicas; configure shared S3-compatible object storage" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -25,10 +28,28 @@ spec:
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
+          whenUnsatisfiable: {{ .Values.topologySpread.whenUnsatisfiable }}
           labelSelector:
             matchLabels:
               app.kubernetes.io/name: {{ include "vussa.name" . }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: {{ .Values.topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "vussa.name" . }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: {{ include "vussa.name" . }}
+                    app.kubernetes.io/instance: {{ .Release.Name }}
       containers:
         - name: vussa
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -40,10 +61,48 @@ spec:
             - name: BIND_ADDRESS
               value: 0.0.0.0:3000
             - name: COOKIE_SECURE
-              value: "true"
+              value: {{ .Values.cookieSecure | quote }}
+            {{- if .Values.corsOrigin }}
+            - name: CORS_ORIGIN
+              value: {{ .Values.corsOrigin | quote }}
+            {{- end }}
+            - name: UPLOAD_DIR
+              value: /data/uploads
+            - name: STORAGE_BACKEND
+              value: {{ .Values.storage.backend | quote }}
+            {{- if .Values.storage.endpoint }}
+            - name: STORAGE_ENDPOINT
+              value: {{ .Values.storage.endpoint | quote }}
+            {{- end }}
+            {{- if .Values.storage.bucket }}
+            - name: STORAGE_BUCKET
+              value: {{ .Values.storage.bucket | quote }}
+            {{- end }}
+            - name: STORAGE_REGION
+              value: {{ .Values.storage.region | quote }}
+            {{- if .Values.fileScanner.url }}
+            - name: FILE_SCANNER_URL
+              value: {{ .Values.fileScanner.url | quote }}
+            {{- end }}
+            {{- if .Values.recovery.webhookUrl }}
+            - name: RECOVERY_WEBHOOK_URL
+              value: {{ .Values.recovery.webhookUrl | quote }}
+            {{- end }}
+            {{- if .Values.notifications.emailUrl }}
+            - name: NOTIFICATION_EMAIL_URL
+              value: {{ .Values.notifications.emailUrl | quote }}
+            {{- end }}
+            {{- if .Values.notifications.browserUrl }}
+            - name: NOTIFICATION_BROWSER_URL
+              value: {{ .Values.notifications.browserUrl | quote }}
+            {{- end }}
+            {{- if .Values.notifications.vapidPublicKey }}
+            - name: VAPID_PUBLIC_KEY
+              value: {{ .Values.notifications.vapidPublicKey | quote }}
+            {{- end }}
           envFrom:
             - secretRef:
-                name: {{ include "vussa.fullname" . }}
+                name: {{ default (include "vussa.fullname" .) .Values.externalSecret.name }}
           securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
           readinessProbe:
             httpGet: { path: /api/v1/health/ready, port: http }
@@ -60,5 +119,16 @@ spec:
           lifecycle:
             preStop:
               exec:
-                command: ["/bin/sh", "-c", "sleep 5"]
+                command: ["/bin/sh", "-c", "kill -TERM 1; sleep 5"]
+          {{- if .Values.persistence.enabled }}
+          volumeMounts:
+            - name: uploads
+              mountPath: /data/uploads
+          {{- end }}
           resources: {{- toYaml .Values.resources | nindent 12 }}
+      {{- if .Values.persistence.enabled }}
+      volumes:
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: {{ include "vussa.fullname" . }}-uploads
+      {{- end }}
