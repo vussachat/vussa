@@ -123,6 +123,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker compose config
+      - run: |
+          docker compose config | grep -q '/var/lib/vussa/uploads'
+          grep -q 'mkdir -p /var/lib/vussa/uploads' Dockerfile
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:

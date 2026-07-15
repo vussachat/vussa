@@ -135,7 +135,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "browser",
         "browser notification configuration failed",
     )?;
-    tokio::spawn(notification_delivery::run_notification_delivery(
+    tokio::spawn(run_notification_delivery(
         repository.pool.clone(),
         email_notifications.clone(),
         browser_notifications.clone(),

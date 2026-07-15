@@ -1,6 +1,10 @@
 use super::*;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 
+mod recovery;
+
+pub(crate) use recovery::{DisabledRecoveryNotifier, RecoveryNotifier, WebhookRecoveryNotifier};
+
 pub(crate) fn password_hash(password: &str) -> Result<String, AppError> {
     if password.len() < 12 || password.len() > 200 {
         return Err(AppError::bad_request("password must be 12–200 characters"));

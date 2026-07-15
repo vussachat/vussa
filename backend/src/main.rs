@@ -27,52 +27,42 @@ use tokio::sync::{Mutex as TokioMutex, Semaphore, broadcast, mpsc, oneshot, watc
 use tracing::{error, info};
 use uuid::Uuid;
 
-mod account;
-mod admin;
-mod api_models;
+mod api;
 mod auth;
 mod bootstrap;
 mod cache;
 mod clock;
 mod config;
 mod database;
-mod discovery;
-mod domain;
 mod error;
-mod media;
 mod metrics;
-mod notification_delivery;
+mod models;
+mod notifications;
 mod outbox;
-mod realtime;
-mod recovery;
 mod repository;
 mod routes;
-mod scanner;
 mod state;
 mod storage;
-mod workspace;
+mod websocket;
 
-use account::*;
-use admin::*;
-use api_models::*;
+use api::*;
 use auth::*;
 use cache::{CacheHealth, RedisCacheHealth, VALKEY_COMMAND_INDEX, VALKEY_COMMANDS};
 use clock::{Clock, SystemClock};
 use config::*;
 use database::{DatabaseHealth, PostgresDatabaseHealth};
-use discovery::*;
-use domain::*;
 use error::{AppError, RepositoryError, map_conflict};
-use media::*;
 use metrics::*;
-use notification_delivery::{DisabledNotificationSink, NotificationSink, WebhookNotificationSink};
-use realtime::*;
-use recovery::{DisabledRecoveryNotifier, RecoveryNotifier, WebhookRecoveryNotifier};
+use models::*;
+use notifications::{
+    DisabledNotificationSink, NotificationSink, WebhookNotificationSink, run_notification_delivery,
+};
 use repository::{ChatRepository, PostgresRepository};
-use scanner::{FileScanner, HttpFileScanner, NoopFileScanner, ScanError};
 use state::{AppState, VerificationKey, VerificationOutcome};
-use storage::{BlobStore, FilesystemBlobStore};
-use workspace::*;
+use storage::{
+    BlobStore, FileScanner, FilesystemBlobStore, HttpFileScanner, NoopFileScanner, ScanError,
+};
+use websocket::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

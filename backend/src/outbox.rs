@@ -25,8 +25,7 @@ pub(crate) async fn run_outbox(pool: PgPool, _client: redis::Client) {
                             );
                         let result = match retry_ids {
                             Some((actor_id, message_id)) => {
-                                workspace::retry_message_notifications(&pool, actor_id, message_id)
-                                    .await
+                                retry_message_notifications(&pool, actor_id, message_id).await
                             }
                             None => {
                                 Err(AppError::bad_request("invalid notification retry payload"))

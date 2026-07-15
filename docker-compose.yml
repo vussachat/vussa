@@ -8,9 +8,9 @@ services:
       BIND_ADDRESS: 0.0.0.0:3000
       DATABASE_URL: postgres://vussa_chat:vussa_chat@postgres:5432/vussa_chat
       VALKEY_URL: redis://valkey:6379
-      UPLOAD_DIR: /data/uploads
+      UPLOAD_DIR: /var/lib/vussa/uploads
     volumes:
-      - uploads-data:/data/uploads
+      - uploads-data:/var/lib/vussa/uploads
     depends_on:
       postgres:
         condition: service_healthy

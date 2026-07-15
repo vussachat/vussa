@@ -699,8 +699,8 @@ pub(crate) async fn handle_client_event(
                 metadata: serde_json::json!({
                     "root_message_id": root_message_id.map(|id| id.to_string()),
                     "file_ids": file_ids.clone(),
-                    "mention_scope": workspace::mention_scope(text),
-                    "online_user_ids": if workspace::mention_scope(text) == Some("here") {
+                    "mention_scope": mention_scope(text),
+                    "online_user_ids": if mention_scope(text) == Some("here") {
                         list_presence(&state.valkey, channel)
                             .await
                             .unwrap_or_default()
@@ -712,7 +712,7 @@ pub(crate) async fn handle_client_event(
                         Vec::new()
                     },
                 }),
-                mentions: workspace::extract_mentioned_usernames(text, &user.username),
+                mentions: extract_mentioned_usernames(text, &user.username),
                 client_id,
                 file_ids: file_ids.clone(),
             };

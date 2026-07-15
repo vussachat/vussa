@@ -90,6 +90,11 @@ The web application supports registration, login, logout, profile updates, cooki
 The development wrapper enables deterministic test fixtures on every start: `test1` through `test6` use matching passwords (`test1:test1`, ..., `test6:test6`), and `test1` has the admin role. These predictable accounts are intentionally enabled only by the wrapper’s `SEED_TEST_ACCOUNTS=true` setting and must not be enabled in production.
 
 Operational endpoints are `/api/v1/health/live`, `/api/v1/health/ready`, `/api/v1/health/startup`, and `/api/v1/metrics`. PostgreSQL and Valkey are required for readiness. The application uses PostgreSQL as the durable source of truth and a transactional outbox for authorization/session invalidation events.
+
+The backend uses modern Rust file modules without `mod.rs`: top-level module
+files such as `api.rs`, `auth.rs`, `repository.rs`, `websocket.rs`,
+`notifications.rs`, and `storage.rs` own descriptive submodules under matching
+directories. Process startup remains in `main.rs`.
 Cookie-authenticated WebSocket upgrades enforce the configured `CORS_ORIGIN`,
 or the request host when no explicit origin is configured; non-browser clients
 without an `Origin` header remain supported.

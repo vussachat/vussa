@@ -4,6 +4,10 @@ use reqwest::{Client, Method, Url};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
+mod scanner;
+
+pub(crate) use scanner::{FileScanner, HttpFileScanner, NoopFileScanner, ScanError};
+
 #[derive(Debug)]
 pub(crate) enum StorageError {
     Configuration(String),
