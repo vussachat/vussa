@@ -1,0 +1,39 @@
+replicaCount: 2
+image:
+  repository: vussa
+  tag: latest
+  pullPolicy: IfNotPresent
+service:
+  type: ClusterIP
+  port: 3000
+resources: {}
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+postgres:
+  url: ""
+valkey:
+  url: ""
+admin:
+  email: ""
+  password: ""
+securityContext:
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+  seccompProfile:
+    type: RuntimeDefault
+podSecurityContext:
+  fsGroup: 10001
+serviceMonitor:
+  enabled: false
+  interval: 15s
+io:
+  # PostgreSQL operator setting; this application chart does not manage external PostgreSQL.
+  method: worker

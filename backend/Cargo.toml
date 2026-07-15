@@ -1,0 +1,26 @@
+[package]
+name = "vussa"
+version = "0.0.1"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+async-trait = "0.1"
+argon2 = "0.5"
+bitcode = { version = "0.6.9", features = ["uuid"] }
+chrono = { version = "0.4", features = ["serde"] }
+http = "1"
+futures-util = "0.3"
+hex = "0.4"
+rand = "0.9"
+redis = { version = "1.3", features = ["aio", "tokio-comp"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "macros", "migrate"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v7", "serde"] }

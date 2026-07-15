@@ -1,0 +1,20 @@
+[package]
+name = "vussa-bench"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+libc = "0.2"
+futures-util = "0.3"
+http = "1"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["cookies", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+vussa = { path = "../backend" }
