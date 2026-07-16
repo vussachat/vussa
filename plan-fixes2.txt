@@ -1,0 +1,138 @@
+==============================================================================
+  VUSSA BACKEND — RUST CODE AUDIT: BUGS & SECURITY ISSUES
+  Generated from full review of backend/src/** and migrations/**
+==============================================================================
+
+This report details the concrete bugs, logic errors, and security issues
+discovered in the backend Rust codebase. 
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 1. SECURITY VULNERABILITIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[SEC-1] User Enumeration via Timing Attack in Login Flow
+  File: `src/api/account.rs` (`login` handler)
+  Issue: If the login email/username does not exist in the database (or the
+         account is disabled), the endpoint returns `unauthorized` immediately.
+         However, if the account exists, it performs the Argon2 password
+         verification (`verify_password_coalesced`), which takes ~300ms.
+         This timing difference (~0.1ms vs ~300ms) allows attackers to easily
+         enumerate registered email addresses and usernames.
+  Fix: If the user is not found, run a dummy Argon2 password verification
+       against a pre-computed placeholder hash to match the execution time of
+       a valid login request.
+
+[SEC-2] SSRF Protection Bypass via IPv4-Mapped IPv6 Addresses
+  File: `src/api/discovery.rs` (`is_public_ip` function)
+  Issue: The `is_public_ip` function validates that the resolved IP of a link
+         preview target is not loopback, private, unspecified, or multicast.
+         However, for `IpAddr::V6`, it does not check if the address is an
+         IPv4-mapped IPv6 address (e.g., `::ffff:127.0.0.1` or
+         `::ffff:169.254.169.254`). Such addresses will bypass the IPv6 checks
+         and resolve to internal IPv4 hosts or cloud metadata services.
+  Fix: In `is_public_ip`, check if the IPv6 address is mapped to an IPv4
+       address using `ip.to_ipv4_mapped()`, and if so, run the IPv4 validation
+       logic on it.
+
+[SEC-3] Lack of Reserved Username Restrictions
+  File: `src/api/account.rs` (`register` handler)
+  Issue: The registration handler does not restrict the usernames that regular
+         users can select. This leads to two issues:
+         1. Spoofing: A user can register as `"system"`, allowing them to post
+            messages that look like system-generated logs (which are authored by
+            `"system"`).
+         2. Denial of Service: A user registering as `"admin"` will prevent the
+            backend from starting up (see [BUG-2] below).
+  Fix: Maintain a list of reserved names (e.g., `"admin"`, `"system"`, `"root"`,
+       `"moderator"`, `"support"`) and reject registration requests using them.
+
+[SEC-4] Lack of Rate Limiting on Authentication Endpoints
+  File: `src/api/account.rs` (`register`, `login`, `reset_recovery`)
+  Issue: While message sending is rate-limited, critical authentication paths
+         such as user registration, login, and password recovery resets are completely
+         un-throttled. Attackers can spam registration to exhaust database
+         space or launch fast dictionary attacks against passwords.
+  Fix: Apply IP-based and user/email-based rate limiting on registration,
+       login, and password recovery requests.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 2. LOGIC & RELIABILITY BUGS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[BUG-1] Valkey Rate Limiter Key Leakage (Permanent Rate Limiting)
+  File: `src/auth.rs` (`enforce_rate_limit` function)
+  Issue: The rate limiter increments the counter key and sets the expiration
+         TTL only when `count == 1`. If the backend process restarts or crashes,
+         or the Valkey connection is lost, in the small window between the `INCR`
+         and `EXPIRE` commands, the rate limit key will persist forever with
+         no expiration. The affected user/IP will be permanently rate-limited.
+  Fix: If `count > 1` but the key has no TTL (`TTL key` returns `-1`), apply
+       the expiration TTL to ensure the key eventually self-heals and expires.
+
+[BUG-2] Database Conflict Crash on Startup via Admin Bootstrap
+  File: `src/bootstrap.rs` (`bootstrap_admin` function)
+  Issue: On startup, if `ADMIN_EMAIL` and `ADMIN_PASSWORD` are set, the server
+         tries to insert the admin user with the username `"admin"`. The SQL
+         uses `ON CONFLICT (lower(email)) DO UPDATE`. However, if a regular
+         user has already registered with the username `"admin"`, this query
+         violates the unique index `users_username_lower_idx` and crashes
+         startup with a database unique violation error.
+  Fix: Handle conflicts on username, or check if the username is taken before
+       attempting to insert, and resolve `SEC-3` to prevent regular users from
+       taking the username `"admin"`.
+
+[BUG-3] Invite Link Use Count Exhaustion by Existing Members
+  File: `src/api/channels.rs` (`accept_invite_link` handler)
+  Issue: When a user accepts an invite link, the code increments the link's
+         `uses` count and publishes a system join message, even if the user
+         is already a member of that channel. An existing channel member can
+         repeatedly accept the invite link to exhaust a limited-use invite,
+         denying new invitees access.
+  Fix: Check if the user is already a member of the channel before incrementing
+       the use count and before posting the system join message.
+
+[BUG-4] Username Changes Cause Own Past Messages to Count as Unread
+  File: `src/api/discovery.rs` (`list_unread` handler)
+  Issue: The `list_unread` query determines unread count by checking if
+         `m.username <> $2` (where `$2` is the user's current username) to
+         exclude self-authored messages. Because message rows permanently store
+         the username at the time of creation rather than joining dynamically,
+         changing a user's username causes all of their older messages (which
+         still have their old username) to be counted as "unread" to themselves.
+  Fix: Use `(m.owner_user_id IS DISTINCT FROM $1)` in the SQL join criteria
+       instead of matching on the mutable `username` string.
+
+[BUG-5] Deadlock/Hang in Cache Connection Recovery Loop
+  File: `src/websocket/rooms.rs` (`recover_forever` loop)
+  Issue: The background connection recovery loop checks the health of Valkey
+         connections by running `redis::cmd("PING").query_async(...)`.
+         If the socket connection is hung or the server is unresponsive
+         without closing the socket, `query_async` can block indefinitely.
+         This freezes the recovery loop, preventing it from restoring other
+         connections or accepting new commands.
+  Fix: Wrap the `PING` check inside a `tokio::time::timeout` block.
+
+[BUG-6] Trap for Private Channel Owners due to Missing Transfer Ownership API
+  File: `src/api/members.rs` (`leave_channel` handler)
+  Issue: Owners of private channels are prevented from leaving the channel
+         (`"the channel owner must transfer ownership or delete the channel"`).
+         However, the application provides no API or capability to promote another
+         member to owner or transfer ownership, trapping owners in private channels
+         indefinitely.
+  Fix: Implement an ownership transfer endpoint or modify the leave check to
+       allow owners to leave if they are the last member or if they nominate
+       a successor.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 3. PERFORMANCE & CONCURRENCY ISSUES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[PERF-1] Sequential Network I/O in Webhook Notification Delivery Loop
+  File: `src/notifications/delivery.rs` (`run_notification_delivery`)
+  Issue: The notification worker fetches up to 32 pending deliveries and loops
+         through them sequentially, executing `sink.deliver().await`. Since the
+         webhook sink makes external HTTP calls with a 10-second timeout, one
+         slow or unresponsive webhook gateway will cause the entire notification
+         pipeline to stall, delaying all notifications for all users.
+  Fix: Concurrently spawn delivery tasks using `tokio::spawn` or run them in
+       parallel using `FuturesUnordered`.

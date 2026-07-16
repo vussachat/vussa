@@ -180,6 +180,10 @@ pub(crate) fn build(state: Arc<AppState>) -> Router {
                     axum::routing::delete(leave_channel),
                 )
                 .route(
+                    "/channels/{name}/owner",
+                    axum::routing::post(transfer_channel_ownership),
+                )
+                .route(
                     "/channels/{name}/members/{user_id}/moderator",
                     axum::routing::post(promote_channel_moderator).delete(demote_channel_moderator),
                 )

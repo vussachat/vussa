@@ -78,11 +78,12 @@ impl ValkeyPool {
                 Err(_) => continue,
             };
             for (index, mut connection) in connections.into_iter().enumerate() {
-                if redis::cmd("PING")
-                    .query_async::<String>(&mut connection)
-                    .await
-                    .is_ok()
-                {
+                let ping_ok = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    redis::cmd("PING").query_async::<String>(&mut connection),
+                )
+                .await;
+                if let Ok(Ok(_)) = ping_ok {
                     continue;
                 }
                 if let Ok(replacement) = self.inner.client.get_multiplexed_async_connection().await

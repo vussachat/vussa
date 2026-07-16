@@ -74,10 +74,9 @@ pub(crate) async fn list_unread(
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     let rows = sqlx::query(
-        "SELECT c.name,COUNT(m.id)::BIGINT AS unread_count,MAX(m.created_at) AS latest_created_at FROM channels c LEFT JOIN channel_members cm ON cm.channel_id=c.id AND cm.user_id=$1 LEFT JOIN channel_reads cr ON cr.channel_id=c.id AND cr.user_id=$1 LEFT JOIN messages m ON m.channel_id=c.id AND m.deleted_at IS NULL AND m.created_at > COALESCE(cr.last_read_created_at,0) AND m.username <> $2 WHERE c.deleted_at IS NULL AND c.archived_at IS NULL AND (c.kind='public' OR cm.user_id IS NOT NULL) AND NOT EXISTS (SELECT 1 FROM user_bans b WHERE b.user_id=$1 AND b.revoked_at IS NULL AND (b.expires_at IS NULL OR b.expires_at > $3) AND (b.channel_id IS NULL OR b.channel_id=c.id)) GROUP BY c.id,c.name ORDER BY c.name",
+        "SELECT c.name,COUNT(m.id)::BIGINT AS unread_count,MAX(m.created_at) AS latest_created_at FROM channels c LEFT JOIN channel_members cm ON cm.channel_id=c.id AND cm.user_id=$1 LEFT JOIN channel_reads cr ON cr.channel_id=c.id AND cr.user_id=$1 LEFT JOIN messages m ON m.channel_id=c.id AND m.deleted_at IS NULL AND m.created_at > COALESCE(cr.last_read_created_at,0) AND (m.owner_user_id IS NULL OR m.owner_user_id <> $1) WHERE c.deleted_at IS NULL AND c.archived_at IS NULL AND (c.kind='public' OR cm.user_id IS NOT NULL) AND NOT EXISTS (SELECT 1 FROM user_bans b WHERE b.user_id=$1 AND b.revoked_at IS NULL AND (b.expires_at IS NULL OR b.expires_at > $2) AND (b.channel_id IS NULL OR b.channel_id=c.id)) GROUP BY c.id,c.name ORDER BY c.name",
     )
     .bind(session.user.id)
-    .bind(&session.user.username)
     .bind(now_millis() as i64)
     .fetch_all(&state.database)
     .await?;
@@ -262,6 +261,9 @@ pub(crate) fn is_public_ip(ip: IpAddr) -> bool {
                 && !ip.is_multicast()
         }
         IpAddr::V6(ip) => {
+            if let Some(ipv4) = ip.to_ipv4() {
+                return is_public_ip(IpAddr::V4(ipv4));
+            }
             !ip.is_loopback()
                 && !ip.is_unique_local()
                 && !ip.is_unicast_link_local()

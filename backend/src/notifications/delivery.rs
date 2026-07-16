@@ -165,34 +165,39 @@ pub(crate) async fn run_notification_delivery(
                         p256dh: row.get("p256dh"),
                         auth: row.get("auth"),
                     };
-                    let sink = if channel == "email" {
-                        &email_sink
-                    } else {
-                        &browser_sink
-                    };
-                    match sink.deliver(&target, &kind, &body).await {
-                    Ok(()) => {
-                        if let Err(update_error) = sqlx::query("UPDATE notification_deliveries SET sent_at=$1,claimed_at=NULL WHERE id=$2 AND sent_at IS NULL")
-                            .bind(crate::now_millis() as i64)
-                            .bind(id)
-                            .execute(&pool)
-                            .await {
-                            tracing::warn!(?update_error, %id, "notification delivery acknowledgement failed");
+                    let pool = pool.clone();
+                    let email_sink = email_sink.clone();
+                    let browser_sink = browser_sink.clone();
+                    tokio::spawn(async move {
+                        let sink = if channel == "email" {
+                            &email_sink
+                        } else {
+                            &browser_sink
+                        };
+                        match sink.deliver(&target, &kind, &body).await {
+                            Ok(()) => {
+                                if let Err(update_error) = sqlx::query("UPDATE notification_deliveries SET sent_at=$1,claimed_at=NULL WHERE id=$2 AND sent_at IS NULL")
+                                    .bind(crate::now_millis() as i64)
+                                    .bind(id)
+                                    .execute(&pool)
+                                    .await {
+                                    tracing::warn!(?update_error, %id, "notification delivery acknowledgement failed");
+                                }
+                            }
+                            Err(error) => {
+                                ::metrics::counter!("vussa_notification_delivery_failures_total", "channel" => channel.clone()).increment(1);
+                                let delay = retry_delay_ms(attempts);
+                                if let Err(update_error) = sqlx::query("UPDATE notification_deliveries SET claimed_at=NULL,next_attempt_at=$1,last_error=$2 WHERE id=$3 AND sent_at IS NULL")
+                                    .bind(crate::now_millis() as i64 + delay)
+                                    .bind(error.to_string())
+                                    .bind(id)
+                                    .execute(&pool)
+                                    .await {
+                                    tracing::warn!(?update_error, %id, "notification delivery retry update failed");
+                                }
+                            }
                         }
-                    }
-                    Err(error) => {
-                        ::metrics::counter!("vussa_notification_delivery_failures_total", "channel" => channel.clone()).increment(1);
-                        let delay = retry_delay_ms(attempts);
-                        if let Err(update_error) = sqlx::query("UPDATE notification_deliveries SET claimed_at=NULL,next_attempt_at=$1,last_error=$2 WHERE id=$3 AND sent_at IS NULL")
-                            .bind(crate::now_millis() as i64 + delay)
-                            .bind(error.to_string())
-                            .bind(id)
-                            .execute(&pool)
-                            .await {
-                            tracing::warn!(?update_error, %id, "notification delivery retry update failed");
-                        }
-                    }
-                }
+                    });
                 }
             }
             Err(error) => tracing::warn!(?error, "notification delivery claim query failed"),

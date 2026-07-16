@@ -146,6 +146,12 @@ pub(crate) async fn enforce_rate_limit(
     let count: i64 = connection.incr(key, 1).await?;
     if count == 1 {
         let _: bool = connection.expire(key, window_seconds as i64).await?;
+    } else {
+        use redis::AsyncCommands;
+        let ttl: i64 = connection.ttl(key).await?;
+        if ttl == -1 {
+            let _: bool = connection.expire(key, window_seconds as i64).await?;
+        }
     }
     if count > limit {
         return Err(AppError::too_many_requests("rate limit exceeded"));

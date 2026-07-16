@@ -10,6 +10,23 @@ async fn bootstrap_admin(repository: &PostgresRepository) -> Result<(), Reposito
     let hash =
         password_hash(&password).map_err(|error| RepositoryError::Migration(error.to_string()))?;
     let mut tx = repository.pool.begin().await?;
+
+    let admin_by_username = sqlx::query("SELECT id, email FROM users WHERE lower(username) = 'admin'")
+        .fetch_optional(&mut *tx)
+        .await?;
+    if let Some(row) = admin_by_username {
+        let existing_id: Uuid = row.get("id");
+        let existing_email: String = row.get("email");
+        if existing_email.to_lowercase() != email.to_lowercase() {
+            let renamed_username = format!("admin_renamed_{}", &existing_id.to_string()[..8]);
+            sqlx::query("UPDATE users SET username=$1 WHERE id=$2")
+                .bind(&renamed_username)
+                .bind(existing_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+
     let id = Uuid::now_v7();
     let now = now_millis() as i64;
     let row = sqlx::query("INSERT INTO users (id,email,username,password_hash,created_at,updated_at) VALUES ($1,lower($2),$3,$4,$5,$5) ON CONFLICT (lower(email)) DO UPDATE SET password_hash=EXCLUDED.password_hash,disabled_at=NULL,updated_at=EXCLUDED.updated_at RETURNING id")

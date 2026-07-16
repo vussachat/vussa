@@ -86,19 +86,25 @@ pub(crate) async fn accept_invite_link(
     if banned {
         return Err(AppError::forbidden("conversation access denied"));
     }
-    sqlx::query("INSERT INTO channel_members (channel_id,user_id,membership_role,invited_by,created_at) VALUES ($1,$2,'member',NULL,$3) ON CONFLICT DO NOTHING")
-        .bind(channel_id).bind(session.user.id).bind(now).execute(&mut *tx).await?;
-    sqlx::query("UPDATE channel_invite_links SET uses=uses+1 WHERE token_hash=$1")
-        .bind(hash)
-        .execute(&mut *tx)
-        .await?;
+    let already_member: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM channel_members WHERE channel_id=$1 AND user_id=$2)")
+        .bind(channel_id).bind(session.user.id).fetch_one(&mut *tx).await?;
+    if !already_member {
+        sqlx::query("INSERT INTO channel_members (channel_id,user_id,membership_role,invited_by,created_at) VALUES ($1,$2,'member',NULL,$3)")
+            .bind(channel_id).bind(session.user.id).bind(now).execute(&mut *tx).await?;
+        sqlx::query("UPDATE channel_invite_links SET uses=uses+1 WHERE token_hash=$1")
+            .bind(hash)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
-    publish_system_message(
-        &state,
-        row.get("name"),
-        format!("{} joined the conversation", session.user.username),
-    )
-    .await?;
+    if !already_member {
+        publish_system_message(
+            &state,
+            row.get("name"),
+            format!("{} joined the conversation", session.user.username),
+        )
+        .await?;
+    }
     Ok(Json(Channel {
         name: row.get("name"),
     }))

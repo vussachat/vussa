@@ -155,3 +155,91 @@ pub(crate) async fn demote_channel_moderator(
     .await?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[derive(serde::Deserialize)]
+pub(crate) struct OwnerTransferRequest {
+    pub(crate) user_id: Uuid,
+}
+
+pub(crate) async fn transfer_channel_ownership(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Json(request): Json<OwnerTransferRequest>,
+) -> Result<StatusCode, AppError> {
+    let session = load_session(&headers, &state.valkey).await?;
+    require_csrf(&headers, &session)?;
+    require_permission(&session.user, "chat:write")?;
+
+    let channel_row = sqlx::query("SELECT id, owner_user_id FROM channels WHERE name=$1 AND deleted_at IS NULL")
+        .bind(&name)
+        .fetch_optional(&state.database)
+        .await?
+        .ok_or(RepositoryError::NotFound)?;
+    let channel_id: Uuid = channel_row.get("id");
+    let current_owner: Option<Uuid> = channel_row.get("owner_user_id");
+
+    if current_owner != Some(session.user.id) {
+        return Err(AppError::forbidden("only the channel owner can transfer ownership"));
+    }
+
+    if request.user_id == session.user.id {
+        return Err(AppError::bad_request("cannot transfer ownership to yourself"));
+    }
+
+    let is_member: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM channel_members WHERE channel_id=$1 AND user_id=$2)")
+        .bind(channel_id)
+        .bind(request.user_id)
+        .fetch_one(&state.database)
+        .await?;
+    if !is_member {
+        return Err(AppError::bad_request("target user is not a member of the channel"));
+    }
+
+    let mut tx = state.database.begin().await?;
+
+    sqlx::query("UPDATE channels SET owner_user_id=$1 WHERE id=$2")
+        .bind(request.user_id)
+        .bind(channel_id)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query("UPDATE channel_members SET membership_role='moderator' WHERE channel_id=$1 AND user_id=$2")
+        .bind(channel_id)
+        .bind(session.user.id)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query("UPDATE channel_members SET membership_role='owner' WHERE channel_id=$1 AND user_id=$2")
+        .bind(channel_id)
+        .bind(request.user_id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+
+    let _ = broadcast(
+        &state.valkey,
+        &name,
+        &ServerEvent::Members {
+            channel: name.clone(),
+            members: channel_members(&state.database, &name).await?,
+        },
+    )
+    .await;
+
+    record_audit_pool(
+        &state.database,
+        AuditEvent {
+            actor: Some(session.user.id),
+            action: "channel.ownership_transferred",
+            target_type: "channel",
+            target_id: channel_id,
+            metadata: serde_json::json!({"old_owner": session.user.id, "new_owner": request.user_id}),
+            created_at: state.clock.now_millis() as i64,
+        },
+    )
+    .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
