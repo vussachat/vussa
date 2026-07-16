@@ -24,6 +24,14 @@ async fn bootstrap_admin(repository: &PostgresRepository) -> Result<(), Reposito
 /// Keeping startup wiring separate makes the process entrypoint small and the
 /// dependency graph explicit for operational and integration testing.
 pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let prometheus = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(
+                "vussa_http_request_duration_seconds".to_string(),
+            ),
+            &[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0],
+        )?
+        .install_recorder()?;
     let valkey_url = env::var("VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
     let valkey = redis::Client::open(valkey_url)?;
     let valkey_pool_size = env::var("VALKEY_POOL_SIZE")
@@ -32,21 +40,9 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|value| *value > 0)
         .unwrap_or(16)
         .clamp(1, 64);
-    let mut valkey_connections = Vec::with_capacity(valkey_pool_size);
-    for _ in 0..valkey_pool_size {
-        valkey_connections.push(valkey.get_multiplexed_async_connection().await?);
-    }
-    let valkey_connections = Arc::new(std::sync::RwLock::new(valkey_connections));
-    VALKEY_COMMANDS
-        .set(valkey_connections.clone())
-        .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "Valkey command pool already initialized",
-            )
-        })?;
+    let valkey_pool = ValkeyPool::new(valkey.clone(), valkey_pool_size).await?;
     info!(valkey_pool_size, "Valkey command pool configured");
-    tokio::spawn(recover_valkey_commands(valkey.clone(), valkey_connections));
+    tokio::spawn(valkey_pool.clone().recover_forever());
 
     let database_url = env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://vussa_chat:vussa_chat@127.0.0.1:5432/vussa_chat".into());
@@ -62,7 +58,10 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    tokio::spawn(outbox::run_outbox(repository.pool.clone(), valkey.clone()));
+    tokio::spawn(outbox::run_outbox(
+        repository.pool.clone(),
+        valkey_pool.clone(),
+    ));
     let retention_repository = repository.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
@@ -74,7 +73,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let rooms = RoomManager::start(&valkey).await?;
+    let rooms = RoomManager::start(&valkey_pool).await?;
     let blob_store: Arc<dyn BlobStore> = match env::var("STORAGE_BACKEND")
         .unwrap_or_else(|_| "filesystem".into())
         .as_str()
@@ -146,7 +145,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "password verification concurrency configured"
     );
     let state = Arc::new(AppState {
-        valkey: valkey.clone(),
+        valkey: valkey_pool,
         cache_health: Arc::new(RedisCacheHealth::new(valkey.clone())),
         database_health: Arc::new(PostgresDatabaseHealth::new(repository.pool.clone())),
         database: repository.pool.clone(),
@@ -155,6 +154,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         scanner,
         recovery_notifier,
         clock: Arc::new(SystemClock),
+        prometheus,
         rooms,
         password_verifiers: Arc::new(Semaphore::new(password_verifier_limit)),
         password_verification_flights: Arc::new(TokioMutex::new(HashMap::new())),
@@ -167,34 +167,6 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
-}
-
-async fn recover_valkey_commands(
-    client: redis::Client,
-    pool: Arc<std::sync::RwLock<Vec<redis::aio::MultiplexedConnection>>>,
-) {
-    loop {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        let connections = match pool.read() {
-            Ok(connections) => connections.clone(),
-            Err(_) => continue,
-        };
-        for (index, mut connection) in connections.into_iter().enumerate() {
-            let healthy = redis::cmd("PING")
-                .query_async::<String>(&mut connection)
-                .await
-                .is_ok();
-            if healthy {
-                continue;
-            }
-            if let Ok(replacement) = client.get_multiplexed_async_connection().await
-                && let Ok(mut writable) = pool.write()
-                && let Some(slot) = writable.get_mut(index)
-            {
-                *slot = replacement;
-            }
-        }
-    }
 }
 
 pub(crate) async fn shutdown_signal() {

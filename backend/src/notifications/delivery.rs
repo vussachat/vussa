@@ -65,17 +65,18 @@ pub(crate) struct WebhookNotificationSink {
 }
 
 impl WebhookNotificationSink {
-    pub(crate) fn from_env(
-        variable: &str,
+    pub(crate) fn new(
+        endpoint: impl Into<String>,
         channel: &'static str,
     ) -> Result<Self, NotificationDeliveryError> {
-        let endpoint = std::env::var(variable).map_err(|_| {
-            NotificationDeliveryError::Configuration(format!("{variable} is not configured"))
+        let endpoint = endpoint.into();
+        let url = reqwest::Url::parse(&endpoint).map_err(|_| {
+            NotificationDeliveryError::Configuration("notification URL is invalid".into())
         })?;
-        if !endpoint.starts_with("https://") && !endpoint.starts_with("http://") {
-            return Err(NotificationDeliveryError::Configuration(format!(
-                "{variable} must use HTTP or HTTPS"
-            )));
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(NotificationDeliveryError::Configuration(
+                "notification URL must use HTTP or HTTPS".into(),
+            ));
         }
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
@@ -86,6 +87,16 @@ impl WebhookNotificationSink {
             endpoint,
             channel,
         })
+    }
+
+    pub(crate) fn from_env(
+        variable: &str,
+        channel: &'static str,
+    ) -> Result<Self, NotificationDeliveryError> {
+        let endpoint = std::env::var(variable).map_err(|_| {
+            NotificationDeliveryError::Configuration(format!("{variable} is not configured"))
+        })?;
+        Self::new(endpoint, channel)
     }
 }
 
@@ -170,6 +181,7 @@ pub(crate) async fn run_notification_delivery(
                         }
                     }
                     Err(error) => {
+                        ::metrics::counter!("vussa_notification_delivery_failures_total", "channel" => channel.clone()).increment(1);
                         let delay = retry_delay_ms(attempts);
                         if let Err(update_error) = sqlx::query("UPDATE notification_deliveries SET claimed_at=NULL,next_attempt_at=$1,last_error=$2 WHERE id=$3 AND sent_at IS NULL")
                             .bind(crate::now_millis() as i64 + delay)
@@ -253,9 +265,8 @@ mod tests {
 
     #[test]
     fn webhook_sink_rejects_invalid_scheme() {
-        unsafe { std::env::set_var("NOTIFICATION_EMAIL_URL", "ftp://sink") };
-        assert!(WebhookNotificationSink::from_env("NOTIFICATION_EMAIL_URL", "email").is_err());
-        unsafe { std::env::remove_var("NOTIFICATION_EMAIL_URL") };
+        assert!(WebhookNotificationSink::new("ftp://sink", "email").is_err());
+        assert!(WebhookNotificationSink::new("https://sink.example.test", "email").is_ok());
     }
 
     #[test]

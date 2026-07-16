@@ -10,12 +10,28 @@ pub(crate) async fn live() -> &'static str {
 pub(crate) async fn startup() -> &'static str {
     "ok"
 }
-pub(crate) async fn metrics() -> ([(HeaderName, HeaderValue); 1], String) {
-    let body = format!(
-        "# TYPE vussa_authentications_total counter\nvussa_authentications_total {}\n# TYPE vussa_active_websockets gauge\nvussa_active_websockets {}\n",
-        AUTHENTICATIONS.load(Ordering::Relaxed),
-        ACTIVE_WEBSOCKETS.load(Ordering::Relaxed)
-    );
+pub(crate) async fn metrics(
+    State(state): State<Arc<AppState>>,
+) -> ([(HeaderName, HeaderValue); 1], String) {
+    ::metrics::gauge!("vussa_active_websockets")
+        .set(ACTIVE_WEBSOCKETS.load(Ordering::Relaxed) as f64);
+    if let Ok(pending) = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM outbox_events WHERE published_at IS NULL",
+    )
+    .fetch_one(&state.database)
+    .await
+    {
+        ::metrics::gauge!("vussa_outbox_pending").set(pending as f64);
+    }
+    if let Ok(pending) = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM notification_deliveries WHERE sent_at IS NULL",
+    )
+    .fetch_one(&state.database)
+    .await
+    {
+        ::metrics::gauge!("vussa_notification_deliveries_pending").set(pending as f64);
+    }
+    let body = state.prometheus.render();
     (
         [(
             HeaderName::from_static("content-type"),
@@ -91,7 +107,7 @@ pub(crate) async fn list_conversations(
 pub(crate) async fn search_users(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<AdminListQuery>,
+    Query(query): Query<UserSearchQuery>,
 ) -> Result<Json<Vec<UserSearchResult>>, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     let search = query.q.unwrap_or_default();
@@ -110,7 +126,7 @@ pub(crate) async fn search_users(
 pub(crate) async fn search_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<AdminListQuery>,
+    Query(query): Query<MessageSearchQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     let term = query.q.unwrap_or_default().trim().to_string();
@@ -123,31 +139,15 @@ pub(crate) async fn search_messages(
     let has_more = rows.len() > limit as usize;
     let mut items = rows
         .into_iter()
-        .map(|row| {
-            let text: String = row.get("text");
-            MessageSearchResult {
-                snippet: text.clone(),
-                highlighted: row.get("highlighted"),
-                message: ChatMessage {
-                    id: row.get("id"),
-                    channel: row.get("channel"),
-                    username: row.get("username"),
-                    text,
-                    created_at: row.get::<i64, _>("created_at") as u64,
-                    edited: row.get("edited"),
-                    deleted: row.get("deleted"),
-                    root_message_id: row.get("root_message_id"),
-                    reply_count: row.try_get::<i64, _>("reply_count").unwrap_or_default() as u32,
-                    metadata: row
-                        .try_get("metadata")
-                        .unwrap_or_else(|_| serde_json::json!({})),
-                    mentions: row.try_get("mentions").unwrap_or_default(),
-                    client_id: row.get("client_id"),
-                    file_ids: row.try_get("file_ids").unwrap_or_default(),
-                },
-            }
+        .map(|row| -> Result<_, sqlx::Error> {
+            let message = ChatMessage::try_from_row(&row)?;
+            Ok(MessageSearchResult {
+                snippet: message.text.clone(),
+                highlighted: row.try_get("highlighted")?,
+                message,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     if items.len() > limit as usize {
         items.truncate(limit as usize);
     }
@@ -174,6 +174,7 @@ pub(crate) async fn link_preview(
     let preview_address = ensure_public_preview_host(&url).await?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(4))
         .resolve(url.host_str().unwrap_or_default(), preview_address)
         .build()
@@ -200,11 +201,12 @@ pub(crate) async fn link_preview(
         bytes.extend_from_slice(&chunk);
     }
     let html = String::from_utf8_lossy(&bytes);
+    let metadata = preview_metadata(&html, &url);
     Ok(Json(serde_json::json!({
         "url": url.as_str(),
-        "title": html_tag_value(&html, "title"),
-        "description": html_meta_value(&html, "description"),
-        "image_url": html_meta_value(&html, "og:image"),
+        "title": metadata.title,
+        "description": metadata.description,
+        "image_url": metadata.image_url,
     })))
 }
 
@@ -269,39 +271,54 @@ pub(crate) fn is_public_ip(ip: IpAddr) -> bool {
     }
 }
 
-pub(crate) fn html_tag_value(html: &str, tag: &str) -> Option<String> {
-    let lower = html.to_lowercase();
-    let start = lower.find(&format!("<{tag}"))?;
-    let content_start = lower[start..].find('>')? + start + 1;
-    let end = lower[content_start..].find(&format!("</{tag}>"))? + content_start;
-    let value = html[content_start..end].trim();
-    (!value.is_empty()).then(|| value.chars().take(300).collect())
+pub(crate) struct PreviewMetadata {
+    pub(crate) title: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) image_url: Option<String>,
 }
 
-pub(crate) fn html_meta_value(html: &str, property: &str) -> Option<String> {
-    let lower = html.to_lowercase();
-    for marker in [
-        format!("property=\"{property}\""),
-        format!("name=\"{property}\""),
-        format!("property='{property}'"),
-        format!("name='{property}'"),
-    ] {
-        if let Some(start) = lower.find(&marker) {
-            let end = lower[start..].find('>')? + start;
-            let tag = &html[start..=end];
-            let tag_lower = tag.to_lowercase();
-            let content = tag_lower.find("content=")? + "content=".len();
-            let quote = tag_lower.as_bytes().get(content).copied()? as char;
-            if quote != '\"' && quote != '\'' {
-                continue;
-            }
-            let value_start = content + 1;
-            let value_end = tag_lower[value_start..].find(quote)? + value_start;
-            let value = tag[value_start..value_end].trim();
-            if !value.is_empty() {
-                return Some(value.chars().take(500).collect());
-            }
+pub(crate) fn preview_metadata(html: &str, base_url: &reqwest::Url) -> PreviewMetadata {
+    use scraper::{Html, Selector};
+
+    let document = Html::parse_document(html);
+    let title_selector = Selector::parse("title").expect("constant selector is valid");
+    let meta_selector = Selector::parse("meta").expect("constant selector is valid");
+    let title = document
+        .select(&title_selector)
+        .next()
+        .map(|node| node.text().collect::<Vec<_>>().join(" "))
+        .and_then(|value| bounded_text(&value, 300));
+    let mut description = None;
+    let mut image = None;
+    for element in document.select(&meta_selector) {
+        let attributes = element.value();
+        let key = attributes
+            .attr("property")
+            .or_else(|| attributes.attr("name"))
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let Some(content) = attributes.attr("content") else {
+            continue;
+        };
+        if description.is_none() && matches!(key.as_str(), "description" | "og:description") {
+            description = bounded_text(content, 500);
+        }
+        if image.is_none() && key == "og:image" {
+            image = base_url
+                .join(content.trim())
+                .ok()
+                .filter(|url| matches!(url.scheme(), "http" | "https"))
+                .map(|url| url.to_string());
         }
     }
-    None
+    PreviewMetadata {
+        title,
+        description,
+        image_url: image,
+    }
+}
+
+fn bounded_text(value: &str, limit: usize) -> Option<String> {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!normalized.is_empty()).then(|| normalized.chars().take(limit).collect())
 }

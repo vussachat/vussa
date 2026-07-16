@@ -2,7 +2,7 @@ use super::*;
 
 #[derive(Clone)]
 pub(crate) struct AppState {
-    pub(crate) valkey: redis::Client,
+    pub(crate) valkey: ValkeyPool,
     pub(crate) cache_health: Arc<dyn CacheHealth>,
     pub(crate) database_health: Arc<dyn DatabaseHealth>,
     pub(crate) database: PgPool,
@@ -11,6 +11,7 @@ pub(crate) struct AppState {
     pub(crate) scanner: Arc<dyn FileScanner>,
     pub(crate) recovery_notifier: Arc<dyn RecoveryNotifier>,
     pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) prometheus: metrics_exporter_prometheus::PrometheusHandle,
     pub(crate) rooms: Arc<RoomManager>,
     pub(crate) password_verifiers: Arc<Semaphore>,
     pub(crate) password_verification_flights:

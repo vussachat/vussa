@@ -66,6 +66,20 @@ impl AppError {
         }
     }
 
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn internal_server_error(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
     pub(crate) fn service_unavailable(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -83,13 +97,16 @@ impl AppError {
 
 impl From<redis::RedisError> for AppError {
     fn from(error: redis::RedisError) -> Self {
-        Self::bad_request(error.to_string())
+        tracing::error!(%error, "cache request failed");
+        ::metrics::counter!("vussa_cache_failures_total").increment(1);
+        Self::service_unavailable("cache service unavailable")
     }
 }
 
 impl From<sqlx::Error> for AppError {
     fn from(error: sqlx::Error) -> Self {
         tracing::error!(%error, "database request failed");
+        ::metrics::counter!("vussa_database_failures_total").increment(1);
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "database request failed".to_string(),
@@ -99,7 +116,18 @@ impl From<sqlx::Error> for AppError {
 
 impl From<RepositoryError> for AppError {
     fn from(error: RepositoryError) -> Self {
-        Self::bad_request(error.to_string())
+        match error {
+            RepositoryError::NotFound => Self::not_found("resource not found"),
+            RepositoryError::Forbidden => Self::forbidden("operation not permitted"),
+            RepositoryError::Database(error) => {
+                tracing::error!(%error, "repository database request failed");
+                Self::internal_server_error("database request failed")
+            }
+            RepositoryError::Migration(error) => {
+                tracing::error!(%error, "repository migration failed");
+                Self::internal_server_error("database initialization failed")
+            }
+        }
     }
 }
 
@@ -144,5 +172,25 @@ mod tests {
         assert_eq!(AppError::bad_request("invalid").to_string(), "invalid");
         assert_eq!(AppError::unauthorized("login").to_string(), "login");
         assert_eq!(AppError::forbidden("denied").to_string(), "denied");
+        assert_eq!(AppError::not_found("missing").status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            AppError::internal_server_error("failed").status,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn repository_errors_have_stable_http_statuses() {
+        assert_eq!(
+            AppError::from(RepositoryError::NotFound).status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            AppError::from(RepositoryError::Forbidden).status,
+            StatusCode::FORBIDDEN
+        );
+        let error = AppError::from(RepositoryError::Migration("secret detail".into()));
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!error.message.contains("secret"));
     }
 }

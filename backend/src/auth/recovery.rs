@@ -42,13 +42,13 @@ pub(crate) struct WebhookRecoveryNotifier {
 }
 
 impl WebhookRecoveryNotifier {
-    pub(crate) fn from_env() -> Result<Self, RecoveryDeliveryError> {
-        let endpoint = std::env::var("RECOVERY_WEBHOOK_URL").map_err(|_| {
-            RecoveryDeliveryError::Configuration("RECOVERY_WEBHOOK_URL is required".into())
-        })?;
-        if !endpoint.starts_with("https://") && !endpoint.starts_with("http://") {
+    pub(crate) fn new(endpoint: impl Into<String>) -> Result<Self, RecoveryDeliveryError> {
+        let endpoint = endpoint.into();
+        let url = reqwest::Url::parse(&endpoint)
+            .map_err(|_| RecoveryDeliveryError::Configuration("recovery URL is invalid".into()))?;
+        if !matches!(url.scheme(), "http" | "https") {
             return Err(RecoveryDeliveryError::Configuration(
-                "RECOVERY_WEBHOOK_URL must use HTTP or HTTPS".into(),
+                "recovery URL must use HTTP or HTTPS".into(),
             ));
         }
         let client = Client::builder()
@@ -56,6 +56,13 @@ impl WebhookRecoveryNotifier {
             .build()
             .map_err(|error| RecoveryDeliveryError::Configuration(error.to_string()))?;
         Ok(Self { client, endpoint })
+    }
+
+    pub(crate) fn from_env() -> Result<Self, RecoveryDeliveryError> {
+        let endpoint = std::env::var("RECOVERY_WEBHOOK_URL").map_err(|_| {
+            RecoveryDeliveryError::Configuration("RECOVERY_WEBHOOK_URL is required".into())
+        })?;
+        Self::new(endpoint)
     }
 }
 
@@ -95,8 +102,7 @@ mod tests {
 
     #[test]
     fn webhook_requires_http_scheme() {
-        unsafe { std::env::set_var("RECOVERY_WEBHOOK_URL", "ftp://delivery") };
-        assert!(WebhookRecoveryNotifier::from_env().is_err());
-        unsafe { std::env::remove_var("RECOVERY_WEBHOOK_URL") };
+        assert!(WebhookRecoveryNotifier::new("ftp://delivery").is_err());
+        assert!(WebhookRecoveryNotifier::new("https://delivery.example.test").is_ok());
     }
 }

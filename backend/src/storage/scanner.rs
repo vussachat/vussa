@@ -38,12 +38,13 @@ pub(crate) struct HttpFileScanner {
 }
 
 impl HttpFileScanner {
-    pub(crate) fn from_env() -> Result<Self, ScanError> {
-        let endpoint = std::env::var("FILE_SCANNER_URL")
-            .map_err(|_| ScanError::Unavailable("FILE_SCANNER_URL is not configured".into()))?;
-        if !endpoint.starts_with("https://") && !endpoint.starts_with("http://") {
+    pub(crate) fn new(endpoint: impl Into<String>) -> Result<Self, ScanError> {
+        let endpoint = endpoint.into();
+        let url = reqwest::Url::parse(&endpoint)
+            .map_err(|_| ScanError::Unavailable("scanner URL is invalid".into()))?;
+        if !matches!(url.scheme(), "http" | "https") {
             return Err(ScanError::Unavailable(
-                "FILE_SCANNER_URL must use HTTP or HTTPS".into(),
+                "scanner URL must use HTTP or HTTPS".into(),
             ));
         }
         let client = Client::builder()
@@ -51,6 +52,12 @@ impl HttpFileScanner {
             .build()
             .map_err(|error| ScanError::Unavailable(error.to_string()))?;
         Ok(Self { client, endpoint })
+    }
+
+    pub(crate) fn from_env() -> Result<Self, ScanError> {
+        let endpoint = std::env::var("FILE_SCANNER_URL")
+            .map_err(|_| ScanError::Unavailable("FILE_SCANNER_URL is not configured".into()))?;
+        Self::new(endpoint)
     }
 }
 
@@ -95,8 +102,7 @@ mod tests {
 
     #[test]
     fn scanner_endpoint_requires_http_scheme() {
-        unsafe { std::env::set_var("FILE_SCANNER_URL", "ftp://scanner") };
-        assert!(HttpFileScanner::from_env().is_err());
-        unsafe { std::env::remove_var("FILE_SCANNER_URL") };
+        assert!(HttpFileScanner::new("ftp://scanner").is_err());
+        assert!(HttpFileScanner::new("https://scanner.example.test").is_ok());
     }
 }

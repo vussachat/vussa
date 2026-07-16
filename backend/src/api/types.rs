@@ -134,21 +134,59 @@ pub(crate) struct SessionView {
     pub(crate) current: bool,
 }
 #[derive(Debug, Deserialize, Default)]
-pub(crate) struct AdminListQuery {
+pub(crate) struct UserListQuery {
     pub(crate) q: Option<String>,
     pub(crate) after: Option<Uuid>,
     pub(crate) limit: Option<i64>,
+}
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct LimitQuery {
+    pub(crate) limit: Option<i64>,
+}
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct BanListQuery {
+    pub(crate) user: Option<Uuid>,
+    pub(crate) limit: Option<i64>,
+}
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct ChannelListQuery {
+    pub(crate) q: Option<String>,
+    pub(crate) limit: Option<i64>,
+}
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct MessageAdminQuery {
     pub(crate) channel: Option<String>,
     pub(crate) user: Option<Uuid>,
     pub(crate) from: Option<i64>,
     pub(crate) to: Option<i64>,
     pub(crate) deleted: Option<bool>,
+    pub(crate) limit: Option<i64>,
+}
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct AuditListQuery {
     pub(crate) actor: Option<Uuid>,
     pub(crate) action: Option<String>,
-    pub(crate) status: Option<String>,
     pub(crate) target: Option<Uuid>,
+    pub(crate) limit: Option<i64>,
+}
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct MessageSearchQuery {
+    pub(crate) q: Option<String>,
+    pub(crate) channel: Option<String>,
+    pub(crate) from: Option<i64>,
+    pub(crate) to: Option<i64>,
     pub(crate) before_created_at: Option<i64>,
     pub(crate) before_id: Option<Uuid>,
+    pub(crate) limit: Option<i64>,
+}
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct ReportListQuery {
+    pub(crate) status: Option<String>,
+    pub(crate) limit: Option<i64>,
+}
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct UserSearchQuery {
+    pub(crate) q: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 pub(crate) struct LinkPreviewQuery {

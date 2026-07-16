@@ -1,8 +1,11 @@
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::Utc;
+use futures_util::{Stream, StreamExt};
 use reqwest::{Client, Method, Url};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::{path::PathBuf, pin::Pin};
+use tokio_util::io::ReaderStream;
 
 mod scanner;
 
@@ -32,8 +35,16 @@ impl std::error::Error for StorageError {}
 #[async_trait]
 pub(crate) trait BlobStore: Send + Sync {
     async fn put(&self, key: &str, contents: &[u8]) -> Result<(), StorageError>;
-    async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError>;
+    async fn get_stream(&self, key: &str) -> Result<BlobObject, StorageError>;
     async fn delete(&self, key: &str) -> Result<(), StorageError>;
+}
+
+pub(crate) type BlobByteStream =
+    Pin<Box<dyn Stream<Item = Result<Bytes, StorageError>> + Send + 'static>>;
+
+pub(crate) struct BlobObject {
+    pub(crate) content_length: Option<u64>,
+    pub(crate) stream: BlobByteStream,
 }
 
 pub(crate) struct S3BlobStore {
@@ -171,7 +182,7 @@ impl BlobStore for S3BlobStore {
         }
     }
 
-    async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {
+    async fn get_stream(&self, key: &str) -> Result<BlobObject, StorageError> {
         let response = self
             .signed_request(Method::GET, key, Vec::new())?
             .send()
@@ -180,11 +191,14 @@ impl BlobStore for S3BlobStore {
         if !response.status().is_success() {
             return Err(StorageError::Http(response.status().to_string()));
         }
-        response
-            .bytes()
-            .await
-            .map(|bytes| bytes.to_vec())
-            .map_err(|e| StorageError::Http(e.to_string()))
+        let content_length = response.content_length();
+        let stream = response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(|error| StorageError::Http(error.to_string())));
+        Ok(BlobObject {
+            content_length,
+            stream: Box::pin(stream),
+        })
     }
 
     async fn delete(&self, key: &str) -> Result<(), StorageError> {
@@ -233,10 +247,16 @@ impl BlobStore for FilesystemBlobStore {
             .map_err(StorageError::Io)
     }
 
-    async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {
-        tokio::fs::read(self.path(key)?)
+    async fn get_stream(&self, key: &str) -> Result<BlobObject, StorageError> {
+        let file = tokio::fs::File::open(self.path(key)?)
             .await
-            .map_err(StorageError::Io)
+            .map_err(StorageError::Io)?;
+        let content_length = file.metadata().await.map_err(StorageError::Io)?.len();
+        let stream = ReaderStream::new(file).map(|chunk| chunk.map_err(StorageError::Io));
+        Ok(BlobObject {
+            content_length: Some(content_length),
+            stream: Box::pin(stream),
+        })
     }
 
     async fn delete(&self, key: &str) -> Result<(), StorageError> {
@@ -260,7 +280,7 @@ mod tests {
             Err(StorageError::Http("injected storage outage".into()))
         }
 
-        async fn get(&self, _key: &str) -> Result<Vec<u8>, StorageError> {
+        async fn get_stream(&self, _key: &str) -> Result<BlobObject, StorageError> {
             Err(StorageError::Http("injected storage outage".into()))
         }
 
@@ -292,7 +312,23 @@ mod tests {
     async fn storage_failure_is_injectable_through_blob_store() {
         let store = FailingBlobStore;
         assert!(store.put("file.bin", b"data").await.is_err());
-        assert!(store.get("file.bin").await.is_err());
+        assert!(store.get_stream("file.bin").await.is_err());
         assert!(store.delete("file.bin").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn filesystem_reads_are_streamed_with_content_length() {
+        let root = std::env::temp_dir().join(format!("vussa-storage-{}", uuid::Uuid::now_v7()));
+        let store = FilesystemBlobStore::new(&root);
+        store.put("file.bin", b"streamed payload").await.unwrap();
+        let mut object = store.get_stream("file.bin").await.unwrap();
+        assert_eq!(object.content_length, Some(16));
+        let mut bytes = Vec::new();
+        while let Some(chunk) = object.stream.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(bytes, b"streamed payload");
+        store.delete("file.bin").await.unwrap();
+        tokio::fs::remove_dir(root).await.unwrap();
     }
 }

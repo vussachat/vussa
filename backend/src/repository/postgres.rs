@@ -139,7 +139,7 @@ impl PostgresRepository {
         Ok(())
     }
 
-    async fn user_from_row(&self, row: sqlx::postgres::PgRow) -> AuthUser {
+    fn user_from_row(&self, row: sqlx::postgres::PgRow) -> AuthUser {
         AuthUser {
             id: row.get("id"),
             email: row.get("email"),
@@ -223,23 +223,10 @@ impl ChatRepository for PostgresRepository {
             .bind(client_id)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row.map(|row| ChatMessage {
-            id: row.get("id"),
-            channel: row.get("channel"),
-            username: row.get("username"),
-            text: row.get("text"),
-            created_at: row.get::<i64, _>("created_at") as u64,
-            edited: row.get("edited"),
-            deleted: row.get("deleted"),
-            root_message_id: row.get("root_message_id"),
-            reply_count: row.try_get::<i64, _>("reply_count").unwrap_or_default() as u32,
-            metadata: row
-                .try_get("metadata")
-                .unwrap_or_else(|_| serde_json::json!({})),
-            mentions: row.try_get("mentions").unwrap_or_default(),
-            client_id: row.get("client_id"),
-            file_ids: row.try_get("file_ids").unwrap_or_default(),
-        }))
+        row.as_ref()
+            .map(ChatMessage::try_from_row)
+            .transpose()
+            .map_err(RepositoryError::from)
     }
 
     async fn load_messages(
@@ -257,25 +244,9 @@ impl ChatRepository for PostgresRepository {
             .fetch_all(&self.pool)
             .await?;
         let mut messages = rows
-            .into_iter()
-            .map(|row| ChatMessage {
-                id: row.get("id"),
-                channel: row.get("channel"),
-                username: row.get("username"),
-                text: row.get("text"),
-                created_at: row.get::<i64, _>("created_at") as u64,
-                edited: row.get("edited"),
-                deleted: row.get("deleted"),
-                root_message_id: row.get("root_message_id"),
-                reply_count: row.try_get::<i64, _>("reply_count").unwrap_or_default() as u32,
-                metadata: row
-                    .try_get("metadata")
-                    .unwrap_or_else(|_| serde_json::json!({})),
-                mentions: row.try_get("mentions").unwrap_or_default(),
-                client_id: row.get("client_id"),
-                file_ids: row.try_get("file_ids").unwrap_or_default(),
-            })
-            .collect::<Vec<_>>();
+            .iter()
+            .map(ChatMessage::try_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
         messages.reverse();
         Ok(messages)
     }
@@ -412,12 +383,22 @@ impl ChatRepository for PostgresRepository {
             .bind(id).bind(email).bind(username).bind(password_hash).bind(now).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO user_roles (user_id, role_id, assigned_at) SELECT $1, id, $2 FROM roles WHERE name='user'")
             .bind(id).bind(now).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO audit_events (id, action, target_type, target_id, created_at) VALUES ($1,'user.registered','user',$2,$3)")
-            .bind(Uuid::now_v7()).bind(id).bind(now).execute(&mut *tx).await?;
+        record_audit(
+            &mut tx,
+            AuditEvent {
+                actor: None,
+                action: "user.registered",
+                target_type: "user",
+                target_id: id,
+                metadata: serde_json::json!({}),
+                created_at: now,
+            },
+        )
+        .await?;
         let row = sqlx::query("SELECT u.id,u.email,u.username, ARRAY(SELECT r.name FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=u.id) AS roles, ARRAY(SELECT DISTINCT p.name FROM permissions p JOIN role_permissions rp ON rp.permission_id=p.id JOIN user_roles ur ON ur.role_id=rp.role_id WHERE ur.user_id=u.id) AS permissions FROM users u WHERE u.id=$1")
             .bind(id).fetch_one(&mut *tx).await?;
         tx.commit().await?;
-        Ok(self.user_from_row(row).await)
+        Ok(self.user_from_row(row))
     }
 
     async fn find_user_for_login(
@@ -447,16 +428,30 @@ impl ChatRepository for PostgresRepository {
         user: Uuid,
         disabled: bool,
     ) -> Result<(), RepositoryError> {
+        let now = now_millis() as i64;
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query("UPDATE users SET disabled_at=CASE WHEN $1 THEN COALESCE(disabled_at,$2) ELSE NULL END, role_version=role_version+1, updated_at=$2 WHERE id=$3")
-            .bind(disabled).bind(now_millis() as i64).bind(user).execute(&mut *tx).await?;
+            .bind(disabled).bind(now).bind(user).execute(&mut *tx).await?;
         if result.rows_affected() == 0 {
             return Err(RepositoryError::NotFound);
         }
-        sqlx::query("INSERT INTO audit_events (id,actor_user_id,action,target_type,target_id,created_at) VALUES ($1,$2,$3,'user',$4,$5)")
-            .bind(Uuid::now_v7()).bind(actor).bind(if disabled { "user.disabled" } else { "user.enabled" }).bind(user).bind(now_millis() as i64).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO outbox_events (id,topic,payload,created_at) VALUES ($1,'auth.invalidate',jsonb_build_object('user_id',$2::text),$3)")
-            .bind(Uuid::now_v7()).bind(user).bind(now_millis() as i64).execute(&mut *tx).await?;
+        record_audit(
+            &mut tx,
+            AuditEvent {
+                actor: Some(actor),
+                action: if disabled {
+                    "user.disabled"
+                } else {
+                    "user.enabled"
+                },
+                target_type: "user",
+                target_id: user,
+                metadata: serde_json::json!({}),
+                created_at: now,
+            },
+        )
+        .await?;
+        queue_auth_invalidation(&mut tx, user, now).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -475,8 +470,18 @@ impl ChatRepository for PostgresRepository {
         if result.rows_affected() == 0 {
             return Err(RepositoryError::NotFound);
         }
-        sqlx::query("INSERT INTO audit_events (id,actor_user_id,action,target_type,target_id,metadata,created_at) VALUES ($1,$2,'user.username_changed','user',$2,jsonb_build_object('username',$3),$4)")
-            .bind(Uuid::now_v7()).bind(user).bind(username).bind(now).execute(&mut *tx).await?;
+        record_audit(
+            &mut tx,
+            AuditEvent {
+                actor: Some(user),
+                action: "user.username_changed",
+                target_type: "user",
+                target_id: user,
+                metadata: serde_json::json!({"username": username}),
+                created_at: now,
+            },
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -487,21 +492,31 @@ impl ChatRepository for PostgresRepository {
         user: Uuid,
         role: &str,
     ) -> Result<(), RepositoryError> {
+        let now = now_millis() as i64;
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query("INSERT INTO user_roles (user_id,role_id,assigned_at) SELECT $1,id,$3 FROM roles WHERE name=$2 ON CONFLICT DO NOTHING")
-            .bind(user).bind(role).bind(now_millis() as i64).execute(&mut *tx).await?;
+            .bind(user).bind(role).bind(now).execute(&mut *tx).await?;
         if result.rows_affected() == 0 {
             return Err(RepositoryError::NotFound);
         }
         sqlx::query("UPDATE users SET role_version=role_version+1,updated_at=$1 WHERE id=$2")
-            .bind(now_millis() as i64)
+            .bind(now)
             .bind(user)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("INSERT INTO audit_events (id,actor_user_id,action,target_type,target_id,metadata,created_at) VALUES ($1,$2,'user.role_assigned','user',$3,jsonb_build_object('role',$4),$5)")
-            .bind(Uuid::now_v7()).bind(actor).bind(user).bind(role).bind(now_millis() as i64).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO outbox_events (id,topic,payload,created_at) VALUES ($1,'auth.invalidate',jsonb_build_object('user_id',$2::text),$3)")
-            .bind(Uuid::now_v7()).bind(user).bind(now_millis() as i64).execute(&mut *tx).await?;
+        record_audit(
+            &mut tx,
+            AuditEvent {
+                actor: Some(actor),
+                action: "user.role_assigned",
+                target_type: "user",
+                target_id: user,
+                metadata: serde_json::json!({"role": role}),
+                created_at: now,
+            },
+        )
+        .await?;
+        queue_auth_invalidation(&mut tx, user, now).await?;
         tx.commit().await?;
         Ok(())
     }

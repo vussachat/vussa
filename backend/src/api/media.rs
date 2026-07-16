@@ -10,23 +10,9 @@ pub(crate) async fn get_message(
         .bind(id).bind(session.user.id).fetch_optional(&state.database).await?.ok_or(RepositoryError::NotFound)?;
     let channel: String = row.get("channel");
     ensure_channel_access(&state.database, &channel, session.user.id).await?;
-    Ok(Json(ChatMessage {
-        id: row.get("id"),
-        channel,
-        username: row.get("username"),
-        text: row.get("text"),
-        created_at: row.get::<i64, _>("created_at") as u64,
-        edited: row.get("edited"),
-        deleted: row.get("deleted"),
-        root_message_id: row.get("root_message_id"),
-        reply_count: row.try_get::<i64, _>("reply_count").unwrap_or_default() as u32,
-        metadata: row
-            .try_get("metadata")
-            .unwrap_or_else(|_| serde_json::json!({})),
-        mentions: row.try_get("mentions").unwrap_or_default(),
-        client_id: row.get("client_id"),
-        file_ids: row.try_get("file_ids").unwrap_or_default(),
-    }))
+    let message = ChatMessage::try_from_row(&row)?;
+    debug_assert_eq!(message.channel, channel);
+    Ok(Json(message))
 }
 
 async fn ensure_message_access(
@@ -93,31 +79,15 @@ pub(crate) async fn unsave_message(
 pub(crate) async fn list_saved_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<AdminListQuery>,
+    Query(query): Query<LimitQuery>,
 ) -> Result<Json<Vec<ChatMessage>>, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     let rows = sqlx::query("SELECT m.id,c.name AS channel,m.username,m.text,m.created_at,m.edited,m.deleted_at IS NOT NULL AS deleted,m.root_message_id,(SELECT COUNT(*) FROM messages replies WHERE replies.root_message_id=m.id) AS reply_count,m.metadata,m.mentions,m.client_id,COALESCE(ARRAY(SELECT mf.file_id FROM message_files mf WHERE mf.message_id=m.id),ARRAY[]::uuid[]) AS file_ids FROM saved_messages s JOIN messages m ON m.id=s.message_id JOIN channels c ON c.id=m.channel_id WHERE s.user_id=$1 AND c.deleted_at IS NULL AND (c.kind='public' OR EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel_id=c.id AND cm.user_id=$1)) AND NOT EXISTS (SELECT 1 FROM user_bans b WHERE b.user_id=$1 AND b.revoked_at IS NULL AND (b.expires_at IS NULL OR b.expires_at > $3) AND (b.channel_id IS NULL OR b.channel_id=c.id)) ORDER BY s.created_at DESC,s.message_id DESC LIMIT $2")
         .bind(session.user.id).bind(query.limit.unwrap_or(100).clamp(1, 200)).bind(now_millis() as i64).fetch_all(&state.database).await?;
     Ok(Json(
-        rows.into_iter()
-            .map(|row| ChatMessage {
-                id: row.get("id"),
-                channel: row.get("channel"),
-                username: row.get("username"),
-                text: row.get("text"),
-                created_at: row.get::<i64, _>("created_at") as u64,
-                edited: row.get("edited"),
-                deleted: row.get("deleted"),
-                root_message_id: row.get("root_message_id"),
-                reply_count: row.try_get::<i64, _>("reply_count").unwrap_or_default() as u32,
-                metadata: row
-                    .try_get("metadata")
-                    .unwrap_or_else(|_| serde_json::json!({})),
-                mentions: row.try_get("mentions").unwrap_or_default(),
-                client_id: row.get("client_id"),
-                file_ids: row.try_get("file_ids").unwrap_or_default(),
-            })
-            .collect(),
+        rows.iter()
+            .map(ChatMessage::try_from_row)
+            .collect::<Result<Vec<_>, _>>()?,
     ))
 }
 
@@ -135,17 +105,28 @@ pub(crate) async fn report_message(
         ));
     }
     ensure_message_access(&state.database, request.message_id, session.user.id).await?;
+    let now = state.clock.now_millis() as i64;
     let report_id: Uuid = sqlx::query("INSERT INTO message_reports (id,message_id,reporter_user_id,reason,created_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (message_id,reporter_user_id) DO UPDATE SET reason=EXCLUDED.reason,status='open',resolved_at=NULL,resolved_by=NULL RETURNING id")
-        .bind(Uuid::now_v7()).bind(request.message_id).bind(session.user.id).bind(reason).bind(now_millis() as i64).fetch_one(&state.database).await?.get("id");
-    sqlx::query("INSERT INTO audit_events (id,actor_user_id,action,target_type,target_id,metadata,created_at) VALUES ($1,$2,'report.created','message_report',$3,jsonb_build_object('message_id',$4,'reason',$5),$6)")
-        .bind(Uuid::now_v7()).bind(session.user.id).bind(report_id).bind(request.message_id).bind(reason).bind(now_millis() as i64).execute(&state.database).await?;
+        .bind(Uuid::now_v7()).bind(request.message_id).bind(session.user.id).bind(reason).bind(now).fetch_one(&state.database).await?.get("id");
+    record_audit_pool(
+        &state.database,
+        AuditEvent {
+            actor: Some(session.user.id),
+            action: "report.created",
+            target_type: "message_report",
+            target_id: report_id,
+            metadata: serde_json::json!({"message_id": request.message_id, "reason": reason}),
+            created_at: now,
+        },
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub(crate) async fn list_message_reports(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<AdminListQuery>,
+    Query(query): Query<ReportListQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     require_permission(&session.user, "moderation:read")?;
@@ -168,8 +149,9 @@ pub(crate) async fn update_message_report(
     let session = load_session(&headers, &state.valkey).await?;
     require_csrf(&headers, &session)?;
     require_permission(&session.user, "moderation:write")?;
+    let now = state.clock.now_millis() as i64;
     let (status, resolved_at, resolved_by) = match action.as_str() {
-        "resolve" => ("resolved", Some(now_millis() as i64), Some(session.user.id)),
+        "resolve" => ("resolved", Some(now), Some(session.user.id)),
         "reopen" => ("open", None, None),
         _ => return Err(AppError::bad_request("unknown report action")),
     };
@@ -185,9 +167,19 @@ pub(crate) async fn update_message_report(
     if result.rows_affected() == 0 {
         return Err(RepositoryError::NotFound.into());
     }
-    sqlx::query("INSERT INTO audit_events (id,actor_user_id,action,target_type,target_id,metadata,created_at) VALUES ($1,$2,$3,'message_report',$4,jsonb_build_object('status',$5),$6)")
-        .bind(Uuid::now_v7()).bind(session.user.id).bind(format!("report.{action}"))
-        .bind(id).bind(status).bind(now_millis() as i64).execute(&state.database).await?;
+    let audit_action = format!("report.{action}");
+    record_audit_pool(
+        &state.database,
+        AuditEvent {
+            actor: Some(session.user.id),
+            action: &audit_action,
+            target_type: "message_report",
+            target_id: id,
+            metadata: serde_json::json!({"status": status}),
+            created_at: now,
+        },
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -207,7 +199,13 @@ pub(crate) async fn upload_file(
     if globally_banned {
         return Err(AppError::forbidden("conversation access denied"));
     }
-    enforce_rate_limit(&format!("chat:rate:upload:{}", session.user.id), 30, 60).await?;
+    enforce_rate_limit(
+        &state.valkey,
+        &format!("chat:rate:upload:{}", session.user.id),
+        30,
+        60,
+    )
+    .await?;
     let mut original_name = "upload.bin".to_string();
     let mut content_type = "application/octet-stream".to_string();
     let mut bytes = None;
@@ -260,7 +258,9 @@ pub(crate) async fn upload_file(
         .bind(id).bind(session.user.id).bind(&storage_key).bind(&original_name).bind(&content_type).bind(bytes.len() as i64).bind(&checksum).bind(state.clock.now_millis() as i64)
         .execute(&state.database).await
     {
-        let _ = state.blob_store.delete(&storage_key).await;
+        if let Err(cleanup_error) = state.blob_store.delete(&storage_key).await {
+            tracing::debug!(?cleanup_error, %storage_key, "orphan upload cleanup failed");
+        }
         return Err(error.into());
     }
     Ok(Json(FileUploadResponse {
@@ -293,24 +293,61 @@ pub(crate) async fn download_file(
     let row = sqlx::query("SELECT f.storage_key,f.original_name,f.content_type FROM files f WHERE f.id=$1 AND f.deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM user_bans global_ban WHERE global_ban.user_id=$2 AND global_ban.revoked_at IS NULL AND (global_ban.expires_at IS NULL OR global_ban.expires_at > $3) AND global_ban.channel_id IS NULL) AND ((f.uploader_user_id=$2 AND NOT EXISTS (SELECT 1 FROM user_bans uploader_ban WHERE uploader_ban.user_id=$2 AND uploader_ban.revoked_at IS NULL AND (uploader_ban.expires_at IS NULL OR uploader_ban.expires_at > $3))) OR EXISTS (SELECT 1 FROM message_files mf JOIN messages m ON m.id=mf.message_id JOIN channels c ON c.id=m.channel_id LEFT JOIN channel_members cm ON cm.channel_id=c.id AND cm.user_id=$2 WHERE mf.file_id=f.id AND m.deleted_at IS NULL AND c.deleted_at IS NULL AND (c.kind='public' OR cm.user_id IS NOT NULL) AND NOT EXISTS (SELECT 1 FROM user_bans channel_ban WHERE channel_ban.user_id=$2 AND channel_ban.revoked_at IS NULL AND (channel_ban.expires_at IS NULL OR channel_ban.expires_at > $3) AND (channel_ban.channel_id IS NULL OR channel_ban.channel_id=c.id))))")
         .bind(id).bind(session.user.id).bind(now_millis() as i64).fetch_optional(&state.database).await?.ok_or(RepositoryError::NotFound)?;
     let storage_key: String = row.get("storage_key");
-    let data = state
+    let object = state
         .blob_store
-        .get(&storage_key)
+        .get_stream(&storage_key)
         .await
         .map_err(|_| AppError::service_unavailable("file storage unavailable"))?;
-    Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::OK)
         .header("content-type", row.get::<String, _>("content_type"))
         .header(
             "content-disposition",
-            format!(
-                "attachment; filename=\"{}\"",
-                row.get::<String, _>("original_name")
-            )
-            .replace('"', ""),
-        )
-        .body(Body::from(data))
+            content_disposition(&row.get::<String, _>("original_name")),
+        );
+    if let Some(content_length) = object.content_length {
+        response = response.header("content-length", content_length);
+    }
+    response
+        .body(Body::from_stream(object.stream))
         .map_err(|_| AppError::service_unavailable("could not construct file response"))
+}
+
+fn content_disposition(name: &str) -> String {
+    let ascii = name
+        .chars()
+        .filter(|character| character.is_ascii_graphic() && !matches!(character, '"' | '\\' | ';'))
+        .take(150)
+        .collect::<String>();
+    let ascii = if ascii.is_empty() {
+        "download"
+    } else {
+        ascii.as_str()
+    };
+    let encoded = name
+        .as_bytes()
+        .iter()
+        .filter(|byte| !matches!(byte, b'\r' | b'\n' | 0))
+        .map(|byte| match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'!'
+            | b'#'
+            | b'$'
+            | b'&'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~' => (*byte as char).to_string(),
+            _ => format!("%{byte:02X}"),
+        })
+        .collect::<String>();
+    format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{encoded}")
 }
 
 #[cfg(test)]
@@ -337,5 +374,14 @@ mod tests {
             "notes.txt"
         );
         assert_eq!(sanitize_upload_name("  report.txt  "), "report.txt");
+    }
+
+    #[test]
+    fn download_names_are_safe_and_utf8_encoded() {
+        let value = content_disposition("résumé \"final\"\r\n.txt");
+        assert!(!value.contains('\r'));
+        assert!(!value.contains('\n'));
+        assert!(value.contains("filename*=UTF-8''r%C3%A9sum%C3%A9%20%22final%22.txt"));
+        assert!(HeaderValue::from_str(&value).is_ok());
     }
 }

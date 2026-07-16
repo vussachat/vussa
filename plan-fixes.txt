@@ -1,0 +1,398 @@
+==============================================================================
+  VUSSA BACKEND — CODE AUDIT & FIX PLAN
+  Generated from full review of backend/src/**
+==============================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ PRIORITY 1 — BUGS & CORRECTNESS ISSUES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[BUG-1] content-disposition header injection in download_file
+  File: src/api/media.rs:306-310
+  Issue: The original_name from the database is interpolated directly into the
+         Content-Disposition header. The code replaces '"' with "" but does not
+         handle newlines, backslashes, or non-ASCII characters. A crafted
+         filename like "file\r\nX-Header: injected" could inject response
+         headers.
+  Fix: Properly encode the filename per RFC 6266 (use filename*=UTF-8''... for
+       non-ASCII, and strip/encode CR/LF/backslash/quotes). Or restrict
+       original_name at upload time to printable ASCII characters only.
+
+[BUG-2] RedisError maps to BAD_REQUEST instead of INTERNAL_SERVER_ERROR
+  File: src/error.rs:84-88
+  Issue: `From<redis::RedisError> for AppError` uses `Self::bad_request(...)`.
+         A Valkey connection failure is a server-side issue, not a client error.
+         Returning 400 misleads clients and hides infrastructure failures from
+         alerting systems that filter on 5xx.
+  Fix: Map redis errors to 503 SERVICE_UNAVAILABLE or 500 INTERNAL_SERVER_ERROR.
+       Avoid leaking the raw redis error message to the client.
+
+[BUG-3] RepositoryError::NotFound maps to 400 BAD_REQUEST instead of 404
+  File: src/error.rs:100-104
+  Issue: All RepositoryError variants (including NotFound) are mapped to 400
+         via `AppError::bad_request(error.to_string())`. NotFound should be 404
+         and Forbidden should be 403. The current mapping also leaks internal
+         error strings like "message or channel not found" and "you can only
+         edit your own messages" which may not match the actual caller context.
+  Fix: Map RepositoryError::NotFound → 404, RepositoryError::Forbidden → 403,
+       and RepositoryError::Database → 500 (without leaking the SQL error).
+
+[BUG-4] Duplicate ChatMessage row-mapping code (15+ copies)
+  File: src/api/media.rs, src/api/admin.rs, src/api/discovery.rs,
+        src/repository/postgres.rs, src/websocket/connection.rs
+  Issue: The ChatMessage struct is manually constructed from a PgRow in at
+         least 15 different places. Each copy must correctly handle try_get
+         fallbacks, i64→u64 casts, etc. Any fix to one mapping must be
+         replicated everywhere. This has already caused inconsistencies:
+         - delete_message uses `row.try_get("root_message_id").ok()` (returns
+           Option<Option<Uuid>>) while others use `row.get("root_message_id")`.
+  Fix: Implement a single `ChatMessage::from_row(row: &PgRow) -> ChatMessage`
+       helper (or derive sqlx::FromRow with renames) and use it everywhere.
+
+[BUG-5] now_millis() called multiple times within a single transaction
+  File: src/api/admin.rs (many handlers), src/repository/postgres.rs
+  Issue: Several handlers call now_millis() multiple times within a single
+         logical operation (e.g., admin_delete_user calls it for the UPDATE,
+         then again for the audit event, and again for the outbox event). If
+         the operations straddle a second boundary, the timestamps will be
+         inconsistent. In admin_create_ban (line 263), `now` is captured once
+         and reused — the other handlers should follow the same pattern.
+  Fix: Capture `let now = now_millis() as i64;` once at the start of each
+       handler and use it for all binds within that request.
+
+[BUG-6] `unsafe { std::env::set_var(...) }` in tests
+  File: src/storage/scanner.rs:98-100, src/notifications/delivery.rs:256-258
+  Issue: These tests modify global process environment variables which is
+         unsafe and can race with other tests. This is marked `unsafe` in newer
+         Rust editions for a reason.
+  Fix: Refactor the constructors to accept a config struct or closure instead
+       of reading env vars directly, or use a serial test harness.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ PRIORITY 2 — SECURITY IMPROVEMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[SEC-1] Link preview is vulnerable to SSRF via DNS rebinding
+  File: src/api/discovery.rs:230-251 (ensure_public_preview_host)
+  Issue: The function resolves the hostname and checks that the IP is public,
+         then the reqwest client makes a separate connection. Between the two
+         DNS lookups, the DNS record could be changed (DNS rebinding / TOCTOU).
+         The `.resolve()` call on the client builder does pin the resolved IP,
+         which mitigates this partially, but the function could be cleaner.
+  Fix: The current `.resolve()` pinning is good. Consider additionally setting
+       a connect timeout and documenting the TOCTOU mitigation explicitly.
+
+[SEC-2] HTML parsing for link preview uses naive string matching
+  File: src/api/discovery.rs:272-307 (html_tag_value, html_meta_value)
+  Issue: The HTML parsing is done with string indexing and .find(). This can
+         be tricked with carefully crafted HTML that places content outside the
+         expected tag boundaries. Not a critical vulnerability since the result
+         is just displayed as preview text, but it could be used for phishing.
+  Fix: Use a lightweight HTML parser (scraper, html5ever) or accept the risk
+       and document it. At minimum, HTML-entity-decode the extracted values.
+
+[SEC-3] Admin password reset has no strength validation
+  File: src/api/admin.rs:102-128 (admin_reset_password)
+  Issue: The admin reset endpoint calls password_hash() directly without
+         running the same validation that the user registration/change password
+         flows use (validate_password_strength). An admin could set a trivially
+         weak password like "a".
+  Fix: Apply the same password strength validation as registration.
+
+[SEC-4] Rate limit keys use session_id for messages but user_id for uploads
+  File: src/websocket/connection.rs:645, src/api/media.rs:210
+  Issue: Message rate limit is per-session (`chat:rate:message:{session_id}`)
+         but file upload rate limit is per-user (`chat:rate:upload:{user_id}`).
+         The inconsistency means a user can bypass message rate limits by
+         opening multiple WebSocket sessions.
+  Fix: Use user_id consistently for all rate limit keys, or document the
+       design intent if per-session is deliberate.
+
+[SEC-5] No CSRF check on unsave_message
+  File: src/api/media.rs:78-91
+  Issue: unsave_message checks for CSRF but does not call require_permission.
+         While save_message does not require moderation permissions either, the
+         inconsistency should be verified as intentional.
+  Fix: Verify that unsave_message does not need a permission check; if so,
+       add a comment documenting the intent.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ PRIORITY 3 — CODE DUPLICATION & MAINTAINABILITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[DUP-1] Massive duplication between WebSocket handlers and REST handlers
+  File: src/websocket/connection.rs vs src/api/workspace.rs
+  Issue: The WebSocket handler for CreateChannel (line 422-449) is a near-exact
+         copy of the REST create_channel handler (workspace.rs:275-308). Same
+         for CreatePrivateChannel, OpenDirect, InviteMember, RemoveMember,
+         and DeleteChannel. Each pair duplicates the SQL, validation, audit
+         event insertion, and system message publishing.
+  Fix: Extract shared domain logic into service functions that both the
+       WebSocket and REST handlers call. For example:
+         async fn create_channel_service(state, user, name) -> Result<...>
+       This is the single biggest maintainability debt in the codebase.
+
+[DUP-2] Ban-check SQL is repeated in 7+ places
+  File: src/api/discovery.rs:61, src/api/media.rs:99, src/api/media.rs:202,
+        src/api/media.rs:293, src/api/workspace.rs:190, src/api/workspace.rs:588
+  Issue: The user_bans NOT EXISTS subquery pattern is copy-pasted into nearly
+         every query that checks channel or conversation access. Each copy
+         slightly differs in column aliases.
+  Fix: Centralize ban-checking into the existing ensure_channel_access and
+       ensure_not_globally_banned helpers. Remove inline ban subqueries from
+       individual handlers where the helper is already called.
+
+[DUP-3] The "admin list" query boilerplate is repeated across all admin handlers
+  File: src/api/admin.rs
+  Issue: Every admin handler follows the same pattern: load_session, check
+         permission, run query, map rows to JSON. The AdminListQuery struct
+         has 13 optional fields, many of which are irrelevant to specific
+         endpoints (e.g., `channel` is only used by message search).
+  Fix: Consider splitting AdminListQuery into endpoint-specific query types.
+       The current "god query struct" makes it easy to accidentally bind the
+       wrong parameter.
+
+[DUP-4] Audit event insertion is repeated ~25 times with slight variations
+  File: Throughout admin.rs, workspace.rs, repository/postgres.rs
+  Issue: Every mutation inserts an audit event with a nearly identical SQL
+         pattern. The only differences are action, target_type, and metadata.
+  Fix: Create an audit helper:
+         async fn record_audit(tx, actor, action, target_type, target_id, metadata)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ PRIORITY 4 — ARCHITECTURE & DESIGN IMPROVEMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[ARCH-1] connection.rs is 1463 lines — extract modules
+  File: src/websocket/connection.rs
+  Issue: This file contains the RoomManager, the WebSocket handler, client
+         event dispatch, hot cache management, presence tracking, broadcasting,
+         and history loading. It is the largest file in the codebase by far.
+  Fix: Split into:
+       - websocket/rooms.rs      (RoomManager, run_room_manager)
+       - websocket/handler.rs    (handle_socket, handle_client_event)
+       - websocket/history.rs    (hot cache, store_message, load_hot_history)
+       - websocket/presence.rs   (refresh_presence, remove_presence, list/sync)
+       - websocket/broadcast.rs  (broadcast, broadcast_control, send_event)
+
+[ARCH-2] workspace.rs is 1142 lines — extract modules
+  File: src/api/workspace.rs
+  Issue: Mixes channel CRUD, membership management, notifications,
+         favorites/drafts, and invite link logic in a single file.
+  Fix: Split into:
+       - api/channels.rs         (create, join, leave, favorites)
+       - api/members.rs          (invite, remove, promote, demote)
+       - api/conversations.rs    (direct messages, private channels)
+       - api/notifications.rs    (notification preferences, subscriptions)
+       - api/drafts.rs           (get/update/delete draft)
+
+[ARCH-3] Raw SQL queries in handler functions — repository layer is bypassed
+  File: src/api/admin.rs, src/api/workspace.rs, src/api/discovery.rs,
+        src/api/media.rs, src/websocket/connection.rs
+  Issue: The ChatRepository trait defines a clean persistence interface, but
+         most handlers bypass it entirely and execute raw sqlx queries against
+         `state.database` directly. The repository trait only covers basic
+         CRUD for messages and channels. All admin, notification, moderation,
+         membership, ban, audit, and file operations are raw SQL in handlers.
+  Fix: Either:
+       a) Expand ChatRepository (or add sibling traits like ModerationRepository,
+          MembershipRepository, etc.) to encapsulate all SQL, or
+       b) Accept the current "thin repository" approach and document that the
+          repository trait is only for operations that need test doubles. In
+          either case, the inline SQL in handlers should at least be extracted
+          into named functions for readability.
+
+[ARCH-4] Valkey connection management uses global OnceLock
+  File: src/cache.rs
+  Issue: `valkey_commands()` reaches into a global `OnceLock<Arc<RwLock<Vec<
+         MultiplexedConnection>>>>` to get a connection. This makes testing
+         impossible without a live Valkey instance and creates a hidden global
+         dependency. Most functions accept `_client: &redis::Client` as a
+         parameter but then ignore it and call valkey_commands() instead
+         (e.g., load_hot_history, refresh_presence, broadcast).
+  Fix: Pass the connection pool through AppState consistently, remove the
+       global OnceLock, and use the client parameter that functions already
+       accept. This is a significant refactor but would greatly improve
+       testability.
+
+[ARCH-5] Outbox processor is monolithic
+  File: src/outbox.rs
+  Issue: The outbox processor handles two completely different topic types
+         (auth.invalidate and message.notifications) in a single match block
+         with deeply nested logic. The error handling differs between topics
+         and the code is hard to follow.
+  Fix: Extract per-topic handlers:
+         async fn handle_auth_invalidate(pool, payload) -> Result<()>
+         async fn handle_notification_retry(pool, payload) -> Result<()>
+       The main loop should just dispatch to the appropriate handler.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ PRIORITY 5 — PERFORMANCE & OPERATIONAL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[PERF-1] list_presence fetches each user's presence data one-at-a-time
+  File: src/websocket/connection.rs:1350-1372
+  Issue: list_presence calls SMEMBERS to get all user IDs, then loops and
+         issues a separate GET for each user. For a channel with 50 users,
+         this is 51 Valkey round trips.
+  Fix: Use MGET to fetch all presence keys in a single round trip:
+         let keys: Vec<String> = ids.iter().map(|id| presence_key(channel, id)).collect();
+         let values: Vec<Option<String>> = connection.mget(&keys).await?;
+
+[PERF-2] download_file loads entire file into memory
+  File: src/api/media.rs:296-313
+  Issue: blob_store.get() loads the complete file bytes into a Vec<u8>, then
+         wraps it in Body::from(data). For the 25 MiB upload limit, this means
+         each concurrent download allocates up to 25 MiB.
+  Fix: Add a streaming get method to BlobStore that returns an AsyncRead or
+       Stream<Bytes>, and use Body::from_stream. For FilesystemBlobStore, use
+       tokio::fs::File with ReaderStream.
+
+[PERF-3] Notification creation issues N separate INSERT queries per recipient
+  File: src/api/workspace.rs:561-634 (create_message_notifications_with_clock)
+  Issue: For each row returned by the notification recipient query, the
+         function issues up to 3 separate SQL queries (notification insert,
+         email delivery insert, browser delivery insert). A message mentioning
+         @channel in a room with 100 users would issue ~300 queries.
+  Fix: Batch the inserts using UNNEST arrays or a CTE that generates all rows
+       at once.
+
+[PERF-4] Hot history always loads ALL cached messages for "before" pagination
+  File: src/websocket/connection.rs:1155-1177 (load_hot_history_before)
+  Issue: When paginating backwards, load_hot_history_before loads the entire
+         hot tier (up to 300 messages) into Rust, then filters by cursor.
+  Fix: Use ZRANGEBYSCORE with the cursor as the max score to only fetch the
+       relevant subset from Valkey.
+
+[PERF-5] Metrics endpoint is not Prometheus-compatible for histograms
+  File: src/api/discovery.rs:13-26
+  Issue: The metrics endpoint only exports two counters. There are no
+         request latency histograms, error rate counters, or queue depth
+         gauges. The content-type uses `text/plain; version=0.0.4` but this
+         is an older Prometheus exposition format.
+  Fix: Consider using the `metrics` + `metrics-exporter-prometheus` crates
+       to add standard HTTP request metrics (request count, latency histogram
+       by status code and route).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ PRIORITY 6 — CODE QUALITY & STYLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[STYLE-1] Extremely long single-line SQL strings
+  File: Nearly every handler file
+  Issue: SQL queries are written as single-line strings that extend 200+ chars.
+         Examples: discovery.rs:61 (list_unread query is ~450 chars on one line),
+         admin.rs:309 (admin_channels query is ~500+ chars on one line).
+  Fix: Use multi-line string literals with consistent indentation. The sqlx
+       query macro works fine with multi-line strings.
+
+[STYLE-2] Inconsistent use of `axum::extract::Path` vs imported `Path`
+  File: src/api/admin.rs
+  Issue: Some handlers use `axum::extract::Path(user)` with the full path
+         (lines 53, 68, 83, 105, etc.), while media.rs and workspace.rs use
+         the short-form `Path(id)`. This is a stylistic inconsistency.
+  Fix: Use the short-form `Path` consistently everywhere (it's already
+       imported via the glob `use super::*`).
+
+[STYLE-3] admin_users wraps admin_users_query for no clear reason
+  File: src/api/admin.rs:3-9 and :11-48
+  Issue: admin_users() is a 1-line function that calls admin_users_query().
+         admin_users_query takes raw HeaderMap and Arc<AppState> parameters
+         instead of axum extractors, suggesting it was meant to be reused,
+         but it's only called once.
+  Fix: Inline admin_users_query into admin_users and remove the wrapper.
+
+[STYLE-4] user_from_row is async but contains no async operations
+  File: src/repository/postgres.rs:142-151
+  Issue: `user_from_row(&self, row)` is marked `async` but performs no
+         awaiting. It just reads synchronous fields from a PgRow.
+  Fix: Remove the `async` keyword and update call sites.
+
+[STYLE-5] Functions accept `_client: &redis::Client` but never use it
+  File: src/websocket/connection.rs — load_hot_history, hydrate_hot_history,
+        store_message, refresh_presence, remove_presence, list_presence,
+        broadcast
+  Issue: These functions accept a `_client: &redis::Client` parameter
+         (prefixed with _ to silence unused warnings) but internally call
+         the global `valkey_commands()` function. The parameter is misleading.
+  Fix: Either use the parameter to get a connection (preferred, see ARCH-4)
+       or remove it from the function signature.
+
+[STYLE-6] Missing error logging in several fire-and-forget operations
+  File: src/api/admin.rs:523-526 (refresh_moderated_message cache clear),
+        src/websocket/connection.rs:349 (remove_presence on channel switch)
+  Issue: Errors from cache invalidation and presence cleanup are silently
+         discarded with `let _ =`. While these are best-effort operations,
+         at least a debug/trace log would help diagnose issues.
+  Fix: Add `tracing::debug!` for discarded errors in non-critical paths.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ PRIORITY 7 — TESTING GAPS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[TEST-1] No integration tests for API handlers
+  Issue: All existing tests are unit tests for pure functions (channel name
+         validation, mention extraction, HMAC, permalink URLs, etc.). There
+         are no integration tests that exercise the HTTP handlers with a real
+         or mocked database. The admin, moderation, notification, and file
+         upload flows are completely untested.
+  Fix: Add integration tests using sqlx's test database support and a test
+       harness that builds an AppState with real or mock dependencies.
+
+[TEST-2] WebSocket handler has no tests
+  File: src/websocket/connection.rs
+  Issue: The 1463-line WebSocket handler — the core of the application — has
+         only 3 trivial unit tests (origin check, no-origin, retry backoff).
+         None of the 15+ client event types are tested.
+  Fix: Extract handle_client_event into testable service functions (per DUP-1)
+       and test each event type.
+
+[TEST-3] Notification delivery logic is untested end-to-end
+  File: src/api/workspace.rs:561-634, src/notifications/delivery.rs
+  Issue: create_message_notifications_with_clock is a complex function with
+         multi-condition routing (mentions, direct messages, channel messages,
+         @here/@channel scopes, ban exclusions), but has zero tests.
+  Fix: Add unit tests with a test database that verify the correct
+       notification rows are created for each mention/channel/direct scenario.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SUMMARY — RECOMMENDED ORDER OF ATTACK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Phase 1 — Quick wins (bugs, no architectural changes):
+  BUG-1  Content-Disposition header injection
+  BUG-2  Redis error → 400 instead of 5xx
+  BUG-3  RepositoryError::NotFound → 400 instead of 404
+  BUG-5  Inconsistent now_millis() calls in transactions
+  SEC-3  Admin password reset missing strength validation
+  STYLE-4  Async function with no await
+
+Phase 2 — Extract shared logic (highest ROI refactor):
+  DUP-1  Extract service layer for WS/REST shared logic
+  DUP-4  Audit event insertion helper
+  BUG-4  ChatMessage::from_row helper
+
+Phase 3 — Module splitting (readability):
+  ARCH-1  Split connection.rs into sub-modules
+  ARCH-2  Split workspace.rs into sub-modules
+  ARCH-5  Split outbox processor by topic
+
+Phase 4 — Deeper architecture (testability, performance):
+  ARCH-4  Remove global OnceLock, pass Valkey through AppState
+  PERF-1  list_presence MGET batching
+  PERF-3  Batch notification inserts
+  TEST-1  Add integration test harness
+
+Phase 5 — Polish:
+  STYLE-1  Format SQL as multi-line strings
+  STYLE-2  Consistent Path import style
+  PERF-2   Streaming file downloads
+  PERF-5   Prometheus metrics improvement

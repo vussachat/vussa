@@ -132,28 +132,17 @@ pub(crate) fn session_key(id: Uuid) -> String {
     format!("vussa:session:{id}")
 }
 
-pub(crate) fn valkey_commands() -> Result<redis::aio::MultiplexedConnection, AppError> {
-    let pool = VALKEY_COMMANDS
-        .get()
-        .ok_or_else(|| AppError::service_unavailable("Valkey connection unavailable"))?;
-    let connections = pool
-        .read()
-        .map_err(|_| AppError::service_unavailable("Valkey connection unavailable"))?;
-    if connections.is_empty() {
-        return Err(AppError::service_unavailable(
-            "Valkey connection unavailable",
-        ));
-    }
-    let index = VALKEY_COMMAND_INDEX.fetch_add(1, Ordering::Relaxed) % connections.len();
-    Ok(connections[index].clone())
+pub(crate) fn message_rate_key(user_id: Uuid) -> String {
+    format!("chat:rate:message:{user_id}")
 }
 
 pub(crate) async fn enforce_rate_limit(
+    valkey: &ValkeyPool,
     key: &str,
     limit: i64,
     window_seconds: u64,
 ) -> Result<(), AppError> {
-    let mut connection = valkey_commands()?;
+    let mut connection = valkey.connection()?;
     let count: i64 = connection.incr(key, 1).await?;
     if count == 1 {
         let _: bool = connection.expire(key, window_seconds as i64).await?;
@@ -165,7 +154,7 @@ pub(crate) async fn enforce_rate_limit(
 }
 
 pub(crate) async fn create_session(
-    _client: &redis::Client,
+    valkey: &ValkeyPool,
     user: &AuthUser,
 ) -> Result<(Uuid, String), AppError> {
     let id = Uuid::now_v7();
@@ -174,7 +163,7 @@ pub(crate) async fn create_session(
     let csrf = hex::encode(csrf_bytes);
     let user_json = serde_json::to_string(user)
         .map_err(|_| AppError::bad_request("could not create session"))?;
-    let mut connection = valkey_commands()?;
+    let mut connection = valkey.connection()?;
     redis::pipe()
         .atomic()
         .cmd("HSET")
@@ -199,13 +188,13 @@ pub(crate) async fn create_session(
 
 pub(crate) async fn load_session(
     headers: &HeaderMap,
-    _client: &redis::Client,
+    valkey: &ValkeyPool,
 ) -> Result<Session, AppError> {
     let raw = cookie_value(headers, "vussa_session")
         .ok_or_else(|| AppError::unauthorized("authentication required"))?;
     let id =
         Uuid::parse_str(&raw).map_err(|_| AppError::unauthorized("authentication required"))?;
-    let mut connection = valkey_commands()?;
+    let mut connection = valkey.connection()?;
     let values: Vec<Option<String>> = redis::cmd("HMGET")
         .arg(session_key(id))
         .arg(&["csrf", "user"])
@@ -295,6 +284,15 @@ mod tests {
     fn password_policy_rejects_invalid_lengths() {
         assert!(password_hash("short").is_err());
         assert!(password_hash(&"a".repeat(201)).is_err());
+    }
+
+    #[test]
+    fn message_rate_limits_are_user_scoped() {
+        let user_id = Uuid::now_v7();
+        assert_eq!(
+            message_rate_key(user_id),
+            format!("chat:rate:message:{user_id}")
+        );
     }
     #[test]
     fn password_hashes_verify_only_for_the_original_value() {

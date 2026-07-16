@@ -1,0 +1,791 @@
+# Full-Featured, Highly Available Team Chat
+
+## Summary
+
+Implement the work in this order:
+
+1. Refactor the oversized backend `main.rs` into maintainable modules.
+2. Establish comprehensive testing infrastructure.
+3. Add messaging, search, files, notifications, profiles, and moderation.
+4. Harden the system for Kubernetes-native HA and fail-over.
+5. Validate every function, API, event, migration, and operational path.
+
+## Phase 1: Backend refactoring
+
+Split `backend/src/main.rs` into focused modules while preserving behavior and API compatibility.
+
+Recommended structure:
+
+- `config.rs` — environment configuration and defaults
+- `error.rs` — application and repository errors
+- `models.rs` — database, API, WebSocket, and domain types
+- `auth/` — registration, login, sessions, CSRF, password verification
+- `repository/` — repository traits and PostgreSQL implementations
+- `api/` — HTTP handlers grouped by authentication, account, channels, users, and administration
+- `websocket/` — connection lifecycle, client events, server events, room handling, reconnection support
+- `messages/` — sending, editing, deletion, history, pagination, and caching
+- `presence/` — presence, typing, status, and participant synchronization
+- `notifications/` — notification creation, delivery, preferences, and read state
+- `search/` — message indexing and search handlers
+- `storage/` — file metadata and object-storage integration
+- `outbox.rs` — transactional outbox publishing and retries
+- `metrics.rs` — metrics and operational endpoints
+- `state.rs` — shared application state and dependency construction
+- `routes.rs` — router assembly
+- `main.rs` — process startup only
+
+Refactoring requirements:
+
+- Preserve existing routes, event names, permissions, and database behavior.
+- Introduce explicit traits around PostgreSQL, Valkey, object storage, notifications, and clock/time providers.
+- Remove duplicated authorization, validation, serialization, and error-mapping logic.
+- Keep modules independently testable.
+- Add characterization tests before moving behavior.
+- Compile and run the existing test/benchmark flows after each refactoring stage.
+- Avoid changing public behavior until the modular structure is stable.
+
+## Phase 2: Testing foundation
+
+Before adding features:
+
+- Add unit-test modules beside each backend module.
+- Add PostgreSQL repository integration tests.
+- Add Valkey integration tests.
+- Add HTTP handler tests.
+- Add WebSocket protocol tests.
+- Add frontend component and state-reducer tests.
+- Add end-to-end test fixtures with isolated databases and cache namespaces.
+- Add deterministic clock and ID providers for tests.
+- Add failure-injection interfaces for database, cache, storage, and notification failures.
+- Add CI checks for formatting, static analysis, backend tests, frontend checks, and migrations.
+
+Every existing function should receive either a direct unit test, an integration test, an end-to-end test, or an explicit documented reason why direct testing is inappropriate.
+
+## Phase 3: Core chat capabilities
+
+Add and test:
+
+- Message deletion and restoration
+- Reactions
+- Threads and replies
+- Message permalinks
+- Markdown and safe link rendering
+- User, channel, and online-user mentions
+- Link previews
+- Draft persistence
+- Idempotent message sending
+- Message reports
+- Realtime deletion, reaction, and thread events
+
+Extend message data with deletion state, root-message references, reply counts, structured metadata, mentions, edit history, and idempotency keys.
+
+## Phase 4: Search, unread state, and notifications
+
+Add full-text search, filters, pagination, highlighted results, saved messages, favorites, recent conversations, read cursors, unread counts, typing indicators, user status, notification preferences, browser push, email notification adapters, and multi-device synchronization.
+
+Use PostgreSQL for durable search, read state, and notification state. Use Valkey TTL keys for ephemeral presence and typing.
+
+## Phase 5: Files and media
+
+Add multipart uploads, object-storage abstraction, attachment metadata, authorized downloads, previews, validation, checksums, scanning hooks, retention cleanup, and orphaned-upload cleanup.
+
+## Phase 6: Channels, users, and moderation
+
+Add channel settings, join/leave, owners, moderators, invite links, favorites, archived-channel browsing, system messages, profiles, custom statuses, account recovery, session management, account export/deletion, bans, moderation queues, posting restrictions, spam controls, and complete audit coverage.
+
+## Phase 7: Kubernetes-native HA and fail-over
+
+Keep backend replicas stateless behind a Kubernetes Service. Add Helm support for replicas, rolling updates, PodDisruptionBudget, HPA, topology spread, anti-affinity, resources, probes, graceful termination, Service/Ingress, NetworkPolicy, metrics, external secrets, migration Jobs, and backup/restore Jobs.
+
+Use HA-capable external services or operators for PostgreSQL and Valkey. Support and test pod termination, rolling deployments, database/cache fail-over, dependency outages, outbox replay, duplicate/delayed events, reconnect storms, node/zone failure, graceful shutdown, and recovery without message loss or privilege escalation.
+
+## Required validation
+
+Test backend units, repositories, handlers, WebSockets, migrations, properties, concurrency, security, load, and failure injection. Test frontend components, reducers, reconnects, permissions, uploads, accessibility, and responsive layouts. Validate Helm, manifests, containers, multi-replica behavior, rolling updates, chaos, backup/restore, alerts, and migration compatibility.
+
+CI must fail if formatting, static analysis, any test suite, migration validation, frontend checks, container builds, or HA smoke tests fail.
+
+## Assumptions
+
+- `main.rs` refactoring is the first implementation milestone.
+- Existing routes, WebSocket events, permissions, and migrations remain compatible during refactoring.
+- PostgreSQL is the durable source of truth.
+- Valkey handles shared realtime coordination and ephemeral state.
+- Object storage holds file contents.
+- No feature is complete until normal, unauthorized, concurrent, failure, and recovery paths are tested.
+- Rolling upgrades and backward-compatible migrations are required.
+
+## Implementation tracking
+
+Implemented in the current tree: shared configuration, authentication, clock,
+storage, scanning and cache-health seams, state, API models, repository, realtime, outbox, bootstrap,
+account, administration, discovery, media, and workspace route modules;
+message collaboration; search and unread state; notifications and preferences;
+profiles, sessions, account lifecycle; files and object-storage seams; saved
+messages, reports, favorites, invite links, bans, channel posting restrictions,
+drafts, account recovery with a configurable delivery adapter, email/browser notification delivery interfaces, channel moderator management, SSRF-safe link previews, executable pod fail-over and dependency-recovery smoke coverage; Helm HA resources; backup/restore and migration jobs; CI, frontend
+state and protocol tests, orphaned-file cleanup, claimed transactional outbox
+delivery, authenticated WebSocket/upload integration smoke checks, and container
+build validation; bounded status/retention policies and durable notification
+delivery retries; Service-routed HA protocol checks and PostgreSQL/Valkey
+dependency recovery checks; durable browser push subscriptions passed to the
+notification adapter.
+
+Implementation status: the planned application code, API surface, frontend
+flows, test seams, failure-injection tests, migration checks, smoke scripts,
+and CI gates are complete in this tree. The only remaining sign-off items are
+environment-dependent execution checks: real PostgreSQL/Valkey/object-storage
+provider contracts, multi-zone operator fail-over, node/zone chaos, production
+backup restoration, and rolling upgrades. Those checks cannot be honestly
+claimed from a source-only workspace, but the repository contains the scripts
+and CI jobs required to run them against the deployment environment.
+
+The final audit added direct upload-name sanitization coverage and revalidated
+the moderation report mutation parameter contract. Backend validation now
+passes 42 unit tests and 2 dependency integration tests.
+
+The Helm CI contract now also asserts that the rendered restore Job mounts the
+shared backup PVC at `/backup`, protecting the backup/restore wiring from
+future chart regressions.
+
+The integration smoke now expands its WebSocket channel lifecycle names at
+runtime instead of passing literal shell interpolation syntax, and CI rejects
+escaped shell-variable occurrences in smoke scripts. This fixes channel and
+zone-failure validation errors that static shell parsing could not expose.
+
+The complete local gate was rerun after these fixes: 42 backend unit tests,
+frontend checks/tests/build, Helm render contracts, workflow YAML parsing,
+shell/Python validation, diff hygiene, and terminology hygiene all pass.
+
+The backend refactor now uses modern Rust file modules with descriptive
+submodules and no `mod.rs` files. Root entry modules include `api.rs`, `auth.rs`,
+`repository.rs`, `websocket.rs`, `notifications.rs`, and `storage.rs`; their
+implementations live in files such as `api/account.rs`, `api/admin.rs`,
+`repository/postgres.rs`, `websocket/connection.rs`,
+`notifications/delivery.rs`, `auth/recovery.rs`, and `storage/scanner.rs`.
+Shared `config.rs`, `error.rs`, `models.rs`, `state.rs`, `routes.rs`,
+`metrics.rs`, `outbox.rs`, `main.rs`, and `lib.rs` remain descriptive root
+files. Rust all-features formatting, Clippy, and all backend targets pass after
+the layout correction.
+
+The runtime-oriented smoke audit also verified that the kind node names match
+the configured cluster, and that the corrected zone-failure script now expands
+namespace, release, deployment, service, zone, node arrays, and probe names at
+execution time.
+
+The CI shell-variable guard was executed from the parsed workflow YAML itself,
+confirming that the guard command—not merely its source representation—passes
+against the current smoke scripts.
+
+Compose filesystem uploads now use the same writable `/var/lib/vussa/uploads`
+path created and owned by the non-root backend image, avoiding a container-only
+path mismatch during local file-upload tests. CI asserts the Compose/Image path
+contract.
+
+The frontend now registers a service worker and provides an opt-in browser push
+control backed by the authenticated VAPID configuration endpoint (with a
+VITE_VAPID_PUBLIC_KEY development fallback); its subscription is persisted
+through the durable notification-subscription API. Final local validation passes for
+backend formatting, linting, and tests; frontend tests, type checks, and build;
+shell/Python syntax; compose validation; Helm lint/render; diff hygiene; and
+the repository terminology audit. Live PostgreSQL/Valkey, object-storage,
+external notification-provider, multi-replica Kubernetes, chaos, backup/restore,
+and production upgrade checks remain environment-dependent and must run in the
+deployment environment before production sign-off.
+
+The production deployment path now includes an adapter-node frontend image,
+frontend Deployment/Service/PDB resources, same-origin API/WebSocket routing,
+and an HA-safe Helm guard that rejects local filesystem uploads with multiple
+backend replicas. The integration smoke script also exercises operational
+metrics, favorites, saved messages, reports, notification preferences, profile
+reads, and account export.
+PostgreSQL readiness now uses an injectable database-health interface alongside
+the existing cache-health interface; the backend unit suite covers both
+dependency failure seams.
+CI now includes a disposable kind-cluster job with PostgreSQL, Valkey, and
+S3-compatible dependencies; it builds both images, installs the Helm release,
+and runs authenticated service-routed pod replacement and rolling-restart
+smoke coverage. The job also scales Valkey down and back up, asserting readiness
+failure and recovery. Production-grade operator failover and chaos remain
+separate from this disposable fixture.
+After the HA traffic test, CI archives the live PostgreSQL database, restores
+it into a disposable database, and verifies the restored schema.
+The chart now supplies default CPU/memory requests so its HPA can calculate
+utilization, and its optional NetworkPolicy permits DNS plus configured
+database/cache and external HTTP(S) dependencies.
+The Valkey Pub/Sub room manager now reconnects with bounded exponential
+backoff and resubscribes the control channel and all active rooms after a
+connection loss, allowing realtime traffic to recover without pod restart.
+The command connection pool is replaceable and has a periodic PING watchdog
+that recreates failed multiplexed connections after cache failover.
+The authenticated WebSocket probe now validates message editing, reactions,
+thread history, read-state synchronization, and deletion events in addition to
+send/idempotency behavior.
+Link previews now pin the HTTP client to the DNS address that passed the public
+IP check, closing the validation/fetch DNS-rebinding window.
+The chat UI now exposes saved-message toggling and message reporting alongside
+the corresponding authenticated APIs. Frontend validation was rerun after this
+change: Svelte diagnostics completed with warnings only, frontend tests passed,
+and the production adapter-node build completed.
+The administration surface now includes report-queue and ban-management tabs;
+the report API returns channel/message context and supports CSRF-protected
+resolve/reopen transitions, with audit events for each transition. The report
+queue status filter is now explicit and tested through compilation and the
+frontend type/build checks.
+Message permalinks are now permission-checked, returned by a dedicated API
+endpoint, and exposed through the chat message tools.
+The integration smoke contract now asserts that ordinary users are denied the
+moderation queue, then exercises a created report and permalink using the
+authenticated WebSocket message identifier. The WebSocket probe emits that
+identifier for downstream API assertions.
+CI’s disposable Kubernetes job now also scales PostgreSQL down and verifies
+readiness failure and recovery, complementing the existing Valkey outage gate.
+README operations documentation now distinguishes disposable kind checks from
+the required production operator-managed, multi-zone database and cache
+services.
+CI now provisions a disposable administrator and the integration smoke checks
+the protected administration, moderation-report, and ban-list API contracts
+during both backend and Kubernetes HA jobs.
+Those admin checks now perform report resolve/reopen and ban create/revoke
+mutations against real smoke data, not only list endpoints.
+The HA test installation disables secure cookies only for its HTTP port-forward;
+the production chart default remains secure, eliminating a CI authentication
+false negative without weakening production transport defaults.
+Message search now returns a keyset cursor with each page and the frontend
+provides a load-more action, while retaining channel and time filters plus
+highlighted matches.
+The chat frontend now loads durable unread counts and displays channel badges,
+renders received reaction summaries on each message, and keeps the existing
+notification/read controls visible in the chat tools.
+The frontend now also exposes a settings dialog for profile display name,
+custom status/expiry, and durable email/browser/channel notification preferences.
+Active bans are now enforced consistently in channel discovery, unread counts,
+conversation summaries, and realtime channel refresh payloads, including both
+global and channel-scoped bans.
+
+Archived channels are now excluded from normal discovery, unread counts, and
+conversation summaries while remaining available to authorized users for
+read-only browsing and to administrators for restoration. Every visible chat
+message now exposes reaction, thread, read, permalink, save, report, edit, and
+delete actions; the thread panel renders replies and supports live replies.
+The chart now optionally emits Prometheus availability and WebSocket capacity
+alerts and adds zone-level replica spreading alongside hostname spreading.
+Lifecycle operations now persist durable system messages for channel creation,
+private membership changes, invite acceptance, and archive/restore operations;
+the integration smoke contract verifies their visibility. The composer now
+offers tested username suggestions for unfinished @mention tokens.
+Lifecycle messages and membership refresh events are also published to active
+WebSocket rooms so connected clients receive the same updates as durable
+history readers.
+Ban-expiry comparisons use the repository's Unix-millisecond clock consistently
+across those queries. Durable message notifications now honor mention,
+direct-message, and channel-message preferences, suppress recipients with
+active bans, and preserve delivery metadata for email/browser adapters.
+The integration smoke path now verifies mention notification creation and that
+an actively banned account cannot see channel or unread discovery results.
+Mention parsing has dedicated unit coverage; the backend suite now passes 34
+tests after the notification and authorization changes.
+The backend suite now passes 36 tests, including injectable storage and
+notification delivery failures.
+Archived channels remain browsable for retention/archive access but are
+read-only for ordinary users; moderators retain the explicit moderation path.
+Private and direct conversation summaries now include durable last-message
+activity and are ordered by recent activity. Members can leave conversations
+through a CSRF-protected endpoint; owners are prevented from orphaning private
+channels. The integration smoke path exercises both owner protection and
+member leave visibility.
+Conversation peer joins are restricted to direct channels, preventing duplicate
+private-channel summaries when a channel has several members.
+Backup CronJobs and restore Jobs now inherit the chart service account and
+non-root pod/container security contexts, matching application and migration
+workloads; backup/restore rendering is covered by Helm validation.
+The frontend now passes Svelte diagnostics with zero errors and zero warnings
+after removing an unused legacy selector.
+The chat tools now provide browsable saved-message navigation and favorite
+channel loading/toggle controls, backed by the existing authenticated APIs.
+WebSocket heartbeats now verify the durable session key and close invalidated
+connections; the frontend returns to sign-in on session expiry. Integration
+smoke coverage now exercises saved/favorite mutations and administrator
+session invalidation.
+Direct-message preference smoke coverage now uses a real direct conversation
+and verifies durable direct-message notification creation.
+Notification creation is now idempotent per recipient/message/kind, and
+message retries reconcile notifications after a transient post-commit failure.
+The WebSocket smoke probe now verifies that a repeated client message ID
+returns the original message instead of creating a duplicate.
+The notification idempotency migration safely removes legacy duplicate rows
+and their delivery records before adding the uniqueness constraint.
+Private/direct mention delivery now requires room membership; the integration
+smoke path verifies a departed private-room member receives no notification.
+Storage and notification sink failure-injection tests now exercise their
+explicit async dependency seams alongside database and cache failure tests.
+Saved-message and favorite-channel listings now enforce current private-room
+membership, preventing access after a user leaves.
+The integration smoke path now saves and favorites a private message before
+membership removal, then verifies both listings hide it afterward.
+Pub/Sub connection loss now emits a client resync signal; the frontend
+reconnects and replays durable channel history instead of silently missing
+events published during fail-over.
+Backend pod termination now signals the process before sleeping, so readiness
+is withdrawn before Kubernetes drains the pod from the Service.
+The frontend deployment uses the same signal-first termination drain.
+Normal composer messages now carry client-generated idempotency keys, and
+stale WebSocket callbacks cannot schedule duplicate reconnects.
+Pending composer and thread messages are replayed after reconnecting to their
+room and cleared only after the durable message event is observed.
+Idempotency conflicts now compare text, thread root, and attachment IDs.
+Notification creation failures now enqueue durable outbox retry jobs, which
+reconcile recipient notifications and delivery records across replicas.
+Notification delivery rows are idempotent per notification/channel, with a
+safe migration for duplicates created by earlier retries.
+Notification retry jobs are discarded cleanly when retention removes their
+source message, avoiding poison jobs that would otherwise retry forever.
+Private-channel owners can now copy expiring invite links in the chat client;
+authenticated invite-link URLs are accepted automatically on page load/login.
+The integration smoke flow now creates a single-use private invite link and
+accepts it with a second account before exercising membership behavior.
+Administrative single and bulk message moderation now broadcasts update events
+and invalidates hot history so active clients see delete/restore changes.
+
+Completion boundary: all code and automated checks available in this workspace
+are implemented and passing. Live dependency, multi-replica Kubernetes,
+operator fail-over, chaos, external-provider, and production upgrade evidence
+still requires running the supplied CI and smoke workflows against those
+environments; it cannot be truthfully completed from this sandbox alone.
+
+Message persistence now includes backward-compatible JSON metadata and
+normalized mention arrays, with a generated PostgreSQL full-text vector and
+GIN indexes. Search uses the indexed vector while retaining substring fallback
+for existing query behavior. Backend, frontend, script, Helm, diff, and
+terminology checks were rerun after this change; live cluster execution remains
+the only unverified boundary.
+
+Thread messages now expose durable reply counts in repository, search,
+permalink, history, and cache-backed payloads. The frontend state reducer
+increments the parent count exactly once for live replies, and the backend
+round-trip plus frontend reducer tests cover this behavior.
+
+The HA smoke gate now requires the configured backend PodDisruptionBudget to
+allow a safe voluntary disruption and verifies at least two ready Service
+endpoints before and after pod replacement, in addition to its existing
+authenticated traffic and rollout checks.
+
+Structured metadata and normalized mentions are now part of the public message
+payload, repository/cache round-trips, search results, saved-message reads,
+permalinks, and realtime messages. Message persistence binds both fields in
+the same insert as the message, and the integration smoke path fetches a sent
+mentioned message to verify the exposed metadata/mention contract.
+
+Attached files now have user-visible links in the chat's latest-message tools,
+using the authorization-checked file download endpoint; upload, ownership,
+download, and message association remain covered by the integration flow.
+
+Saved-message payloads now preserve associated file IDs instead of dropping
+them during response mapping. The integration smoke client sends an attached
+file, saves the resulting message, and verifies the saved-message response
+contains both the message and attachment identifiers.
+
+The disposable HA CI cluster now uses one control-plane node and three worker
+nodes with distinct zone labels. Backend and frontend topology selectors are
+component-scoped, and the HA smoke gate requires backend replicas on at least
+two nodes as well as two ready Service endpoints across pod replacement.
+
+The HA smoke gate additionally resolves each backend pod's node zone and
+requires replicas in at least two distinct zones before and after replacement.
+
+CI now also stops one disposable kind worker, verifies the backend reschedules
+two available replicas and continues serving readiness through the Service,
+then restores the worker and waits for node recovery.
+
+The node-failure smoke test now selects a node hosting an actual backend pod by
+default, ensuring the rescheduling assertion exercises the backend workload;
+an explicit NODE override remains available for targeted drills.
+
+CI now verifies the post-migration PostgreSQL schema contains message metadata,
+mentions, the generated full-text vector, and both GIN indexes. Helm CI also
+renders and asserts the optional ServiceMonitor resource in addition to the
+PrometheusRule.
+
+The CI workflow itself was YAML-invalid because shell assertions containing
+`kind:` were unquoted; those commands are now quoted and the workflow,
+dependency manifest, and multi-node kind configuration parse successfully.
+
+Authorization is now consistent across message reads, permalinks, saves,
+reports, saved-message listings, and file downloads: active global or
+channel-scoped bans are rejected through the shared channel-access predicate.
+The integration smoke flow verifies banned users cannot access a message,
+permalink, or associated attachment.
+
+The same ban policy now covers favorite-channel listings and invite-link
+acceptance, preventing banned users from discovering favorited private rooms or
+joining a room through a previously issued invite.
+
+Global bans now also prevent new file uploads, closing an unassociated-storage
+bypass; the integration smoke path attempts an upload after banning the user
+and requires rejection.
+
+Cookie-authenticated WebSocket upgrades now enforce same-host or configured
+origin checks, with unit coverage for same-origin, cross-origin, configured
+reverse-proxy, and non-browser clients without an Origin header.
+
+Helm topology spreading now defaults to `DoNotSchedule` for both backend and
+frontend deployments, preventing production co-location when the cluster has
+the required topology domains. A documented `ScheduleAnyway` override remains
+available for intentionally single-node development clusters.
+
+The frontend composer now emits debounced realtime typing start/stop events for
+draft changes, clears the signal when switching conversations, and has focused
+unit coverage for the draft-to-typing transition logic.
+
+The frontend now consumes the authenticated link-preview endpoint for URLs in
+visible messages, deduplicates and bounds preview requests, and renders safe
+title/description/image cards. URL extraction has focused frontend unit tests;
+preview failures remain non-blocking so chat history stays usable.
+
+The participant sidebar now consumes the realtime display-name and custom-status
+fields, with legacy fallbacks to username and roles. The presentation helpers
+have focused frontend coverage, and the frontend suite now passes 13 tests.
+
+Realtime participant presence now carries display names and non-expired custom
+statuses from PostgreSQL, refreshes them during heartbeats, and broadcasts
+updates across room subscribers. Legacy Valkey presence payloads default the
+new fields safely, with backend compatibility coverage and integration smoke
+assertions for durable profile status.
+
+Shared channel/draft normalization and invite-token hashing now live with the
+workspace module, while recovery-token hashing lives with account handling;
+their unit tests moved with the implementations. This further reduces
+application logic remaining in main.rs while preserving the existing route and
+protocol surface.
+
+Session creation/loading, cookie parsing, CSRF and permission checks, rate
+limits, Valkey session access, and auth-cookie construction now live in
+auth.rs, with focused cookie and permission tests. Bootstrap admin creation and
+graceful-shutdown signal handling now live in bootstrap.rs. main.rs is reduced
+to shared runtime state, room infrastructure, remaining channel policy helpers,
+and process startup wiring.
+
+Channel lifecycle and policy logic now also lives in workspace.rs: invite-link
+creation/acceptance, visible-conversation discovery, member lookup, durable
+system messages, access/posting checks, moderator ownership checks, and channel
+creation. main.rs is now 361 lines and contains runtime room infrastructure,
+one conflict mapper, and process startup only; all 40 backend tests still pass.
+
+The realtime RoomManager, room subscription lifecycle, Pub/Sub event routing,
+connection-loss resubscription, and bounded retry policy now live in
+realtime.rs. The room backoff test moved with that implementation. main.rs is
+now 140 lines, containing shared runtime state, conflict mapping, and the
+process entrypoint only.
+
+The Valkey multiplexed command pool and round-robin index now live in cache.rs;
+bootstrap still initializes the pool and its watchdog still replaces failed
+connections. main.rs now contains only application-wide counters/shutdown state,
+conflict mapping, and the process entrypoint.
+
+Application counters and shutdown state now live in metrics.rs, and repository
+conflict-to-HTTP mapping now lives in error.rs. The executable entrypoint is
+reduced to 126 lines with only module wiring and startup invocation; runtime
+responsibilities are owned by their focused modules.
+
+Account lifecycle parity is now exposed in the frontend settings flow: users
+can rotate passwords, inspect and revoke non-current sessions, export their
+account data, and permanently delete the account. Requests use the existing
+CSRF/session protections and busy-state guards. Frontend type-checking,
+13 frontend unit tests, and production build pass; backend formatting,
+clippy, 40 unit tests, shell/Python syntax, diff hygiene, and the terminology
+audit also pass.
+
+The integration smoke contract now covers the complete account lifecycle:
+non-current session revocation is verified to invalidate the second cookie,
+password rotation rejects the old password and accepts the new one, and
+self-deletion invalidates every session for a disposable account. CI now also
+compiles the Python smoke client before running integration checks.
+
+Account security controls are integrated into the existing settings form so
+profile/preferences editing and password/session/export/deletion actions share
+one accessible dialog rather than competing overlays. The frontend check,
+unit suite, and adapter-node production build pass after this UI correction.
+
+Container validation exposed and corrected two release defects: the backend
+builder now uses Rust 1.94, which satisfies the locked sqlx 0.9 MSRV, and
+reqwest's explicit `json` feature is enabled for webhook/recovery payloads.
+The complete backend release compilation and image assembly now pass in the
+Docker build. Helm lint and all supported chart render variants pass, including
+the expected rejection of multi-replica filesystem storage. The local sandbox
+allowed image creation but denied host loopback/Docker-socket access to the
+published service, so the authenticated runtime smoke result remains
+environment-dependent rather than being marked green here.
+
+The workspace now declares Rust 1.94 as its MSRV for both backend and benchmark
+packages, keeping Cargo, Docker, and CI toolchain requirements consistent.
+Cargo metadata confirms both packages inherit the declaration; formatting,
+Clippy, all 40 backend tests, frontend checks/tests, Helm lint, script syntax,
+diff hygiene, and the terminology audit pass afterward.
+
+Administrative role management is now complete end-to-end: the admin user
+table can grant or remove moderator and administrator roles for other users,
+while the existing backend permission and final-administrator safeguards remain
+authoritative. Integration smoke coverage assigns and removes a moderator role
+and verifies both durable user-list states; frontend checks, 13 tests, build,
+and backend validation pass after the change.
+
+Administrative user lifecycle controls now also expose session invalidation,
+password reset, and account deletion in the user table, with confirmation or
+password prompts where destructive/secret input is involved. The integration
+smoke flow resets a disposable user's password, verifies login with the new
+password, deletes that user, and verifies it disappears from the admin listing.
+Frontend checks/tests/build, backend tests/lint, and script hygiene pass.
+
+Administrative channel lifecycle parity now exposes delete and undelete actions
+alongside archive/restore, while protecting the reserved main channel. The
+integration smoke flow creates a disposable admin channel, verifies deletion
+and undelete state through the admin listing, and the frontend/backend/script
+validation gates continue to pass.
+
+Administrative channel settings now expose description and retention editing
+through the same channel table. The smoke flow updates a disposable channel,
+verifies both persisted values, then exercises delete/undelete. Frontend
+diagnostics/tests/build, backend tests/lint, and script hygiene remain green.
+
+Administrative channel posting policy is now exposed end-to-end: the channel
+table can restrict or reopen posting, the persisted policy is reflected after
+reload, and the integration smoke flow verifies both transitions through the
+admin API. Frontend diagnostics/tests/build, backend formatting/Clippy/tests,
+Helm lint, script syntax, diff hygiene, and the terminology audit pass.
+
+The authenticated integration contract now exercises the remaining administrative
+handler families directly: permission and presence reads, channel archive and
+restore, message edit-history reads, single-message moderation, and bulk
+moderation delete/restore. The smoke script’s route paths were checked against
+the router, then shell/Python syntax, backend validation, Helm lint/render, diff
+hygiene, and the terminology audit passed again. Actual multi-zone operator,
+node-chaos, external-provider, backup restoration, and rolling-upgrade results
+still require execution in a Kubernetes-capable environment.
+The retained main-channel smoke fixture makes those moderation assertions
+deterministic even when ordinary probes clean up their own messages.
+Compose configuration also renders successfully with the production-style
+healthcheck and dependency ordering intact.
+
+Bulk moderation now records one audit event per successfully changed message,
+including the action, actor, target, reason, and bulk-operation marker. The
+integration smoke flow verifies both bulk delete and bulk restore audit records;
+backend formatting/Clippy/tests and shell/Python/diff/terminology checks pass.
+
+The audit pass also closed two administrative mutation gaps: channel creation
+now records `channel.created`, and ban revocation records `user.ban_revoked`
+with the affected user and ban identifiers. The integration smoke flow checks
+both records, and the complete backend validation suite remains green.
+
+User-created message reports now also record `report.created` with the report,
+message, reporter, and reason metadata; the smoke flow verifies that audit row
+before resolving and reopening the report. Backend formatting/Clippy/tests and
+all script and hygiene checks pass after the change.
+
+Private-channel member removal and voluntary departure now record
+`channel.member_removed` and `channel.member_left` audit events, including the
+channel and affected user; the integration flow verifies the departure record.
+The backend suite and all shell/Python/diff/terminology checks pass.
+
+Duplicate private-channel invitations no longer generate false
+`channel.member_added` audit events or duplicate system activity: the audit and
+notifications are now emitted only when the membership insert changes a row.
+The smoke flow exercises both the first invite and an idempotent duplicate;
+backend validation and script checks remain green.
+
+Direct-conversation creation now distinguishes a newly created conversation
+from an idempotent reopen and records `channel.direct_created` only for the
+actual insert. The smoke flow verifies the creation audit event; backend
+formatting/Clippy/tests and all script/hygiene checks pass.
+
+Successful recovery-token password resets now record `user.password_recovered`
+inside the same transaction that consumes the token and queues session
+invalidation, preserving an auditable security trail without exposing the
+token. Backend validation and all script/hygiene checks remain green.
+
+Bulk moderation now performs message state changes and their audit inserts in
+one PostgreSQL transaction, then broadcasts refreshed messages only after the
+commit. Ban revocation uses the same mutation-plus-audit atomicity. This closes
+the failure window where a moderation action could outlive its audit record;
+backend formatting/Clippy/tests and script/hygiene checks pass.
+
+Message persistence now links attachments in the same PostgreSQL transaction
+as the message row. The realtime path no longer performs redundant post-commit
+metadata and attachment writes, preventing partially persisted messages when a
+linking operation fails. Backend formatting/Clippy/tests and script/hygiene
+checks pass after the change.
+
+Concurrent sends carrying the same client id now reconcile a uniqueness-race
+insert failure by loading and validating the committed message, then
+re-running idempotent notification reconciliation and returning that message.
+Conflicting payload reuse remains rejected. Backend validation and all script
+and hygiene checks pass.
+
+Client-id lookup now matches the database’s session-wide uniqueness scope rather
+than filtering by channel. Reusing an id in another channel is therefore
+reported as a deterministic conflict instead of leaking a database constraint
+error; same-channel retries remain idempotent. Backend validation and all
+script/hygiene checks pass.
+
+The disposable Kubernetes CI job now builds and loads a distinct upgrade image,
+performs an actual `helm upgrade --reuse-values` with that image, and waits for
+the deployment rollout before node-failure and backup/restore checks. This
+turns rolling-upgrade coverage from restart-only coverage into an image-change
+upgrade gate; workflow structure, Helm lint, diff hygiene, and terminology
+checks pass locally.
+The upgrade step also runs an in-cluster readiness probe after rollout, and the
+workflow YAML parses successfully.
+
+Integration coverage now exercises administrator disable and re-enable actions
+with persisted `disabled_at` assertions, closing the remaining user-lifecycle
+route gap. Shell/Python syntax, diff hygiene, terminology audit, and Helm lint
+pass.
+
+Username changes now execute transactionally with a `user.username_changed`
+audit event and ignore deleted accounts. The integration flow updates the smoke
+user and verifies the persisted audit metadata, while backend and script
+validation remain green.
+
+The core user channel-creation route is now covered end-to-end with a disposable
+public channel, and normal channel creation records `channel.created` audit
+metadata just like administrative creation. Backend formatting/Clippy/tests,
+shell/Python checks, diff hygiene, and terminology audit pass.
+
+The integration contract now also exercises user search, private-member listing,
+channel moderator promotion/demotion, and notification read-state mutation.
+Backend formatting/Clippy/tests, shell/Python syntax, diff hygiene, and the
+terminology audit remain green.
+
+Private-member removal is now covered as well: the smoke flow re-adds the
+departed disposable member, removes them through the owner endpoint, and
+verifies the `channel.member_removed` audit event. Validation gates remain
+green.
+
+Message discovery coverage now verifies channel filtering, PostgreSQL
+highlight markup, and cursor pagination across multiple matching messages.
+The smoke flow also keeps user search after the disposable account exists,
+avoiding an unbound fixture reference. Shell syntax and the terminology audit
+pass.
+
+Ordinary channel creation now performs insertion/restoration and the
+channel.created audit recording in one PostgreSQL transaction, matching the
+atomicity of private and administrative channel mutations. Rust formatting,
+Clippy, and all 40 backend tests pass after the change.
+
+The WebSocket smoke probe now accepts an explicit edit text, allowing search
+fixtures to retain their indexed term after the probe exercises editing,
+reactions, threads, read state, and idempotency. Shell/Python syntax and diff
+hygiene pass.
+
+The disposable Kubernetes CI installation now executes the chart migration hook
+against its live PostgreSQL and Valkey dependencies before deploying the chat
+replicas. Helm CI also asserts the rendered Deployment, Service, PDB, HPA,
+zero-downtime rollout, zone spreading, and termination-drain contracts.
+
+WebSocket action parity is now covered: channel creation, private/direct
+conversation creation, member invite/removal, channel deletion, and their
+durable audit/lifecycle behavior no longer bypass the HTTP invariants. The
+protocol smoke probe additionally verifies reaction removal, typing start/stop,
+history paging, channel listing, and heartbeat presence synchronization.
+
+The integration flow now runs those WebSocket management checks against
+disposable public/private/direct channels and member fixtures, including an
+administrator-only WebSocket channel deletion. Python/shell syntax, Clippy,
+formatting, diff hygiene, and terminology checks pass.
+
+Search results now render the server-provided PostgreSQL highlights in the
+frontend through an escaping helper that permits only controlled mark tags;
+two frontend tests cover positive highlighting and hostile markup. Frontend
+checks, 15 tests, and the production build pass.
+
+The search UI now exposes channel, start-date, and end-date filters and carries
+them through cursor-pagination requests, matching the backend search contract.
+Frontend diagnostics and all 15 frontend tests pass after the change.
+
+External notification, recovery, file-scanner, and S3-compatible storage
+clients now enforce bounded request timeouts (10 seconds for adapters, 15
+seconds for object storage), preventing a stalled dependency from pinning a
+worker during fail-over. Rust formatting, Clippy, and all 40 backend tests
+pass.
+
+HA validation now includes an explicit labeled-zone failure smoke test: CI
+stops every worker in one zone, requires two backend replicas and two ready
+Service endpoints to remain available, probes readiness through the Service,
+and restores the zone nodes during cleanup.
+
+The Helm restore Job is now fail-closed by default: it refuses to run unless
+restore.allowDestructive is explicitly enabled, and the operational README
+documents that the Job uses pg_restore --clean against the configured database.
+CI renders both the guarded and explicitly acknowledged variants; the
+disposable restore smoke continues using a separate database.
+
+The operational handoff now documents both disposable failure modes: single
+node failure and complete labeled-zone failure. It also warns that those
+checks stop kind node containers and must stay isolated from production. README
+and deployment references are consistent with the CI workflow.
+
+Dedicated dependency integration tests were added under
+backend/tests/infrastructure.rs. With CI-provided services they apply the full
+migration set and verify generated search vectors, durable message ownership,
+session/client idempotency constraints, and fixture cleanup against
+PostgreSQL; they also verify namespaced Valkey TTL state. Local runs skip these
+environment tests only when the corresponding service URL is absent, while CI
+fails fast if either required URL is missing.
+
+Kubernetes workload hardening now disables service-account token automounting
+for the backend service account and frontend pod, since neither workload calls
+the Kubernetes API. Helm CI asserts the rendered security contract.
+
+Realtime termination handling now uses an RAII active-WebSocket gauge so failed
+handshakes cannot leak capacity metrics, and established sockets observe the
+shutdown flag and close during the termination window. Rust formatting,
+Clippy, unit tests, Helm rendering, and script/hygiene checks pass.
+
+Message edit and delete responses now retain attached file IDs instead of
+silently dropping attachment metadata from realtime clients. The WebSocket
+attachment smoke path asserts metadata on creation, edit, and deletion; Rust
+and script validation pass.
+
+Administrative moderation refresh events now also preserve the durable reply
+count, preventing a delete/restore operation from resetting thread counters in
+connected clients.
+
+Message search now applies the same global/channel ban checks as direct reads
+and excludes archived channels from normal discovery. The integration smoke
+flow explicitly verifies that an actively banned account cannot discover a
+protected message through search.
+
+Global-ban enforcement now also covers public/private/direct conversation
+creation and invite-link creation over both HTTP and WebSocket paths. The
+integration smoke flow asserts HTTP 403 responses for each creation bypass.
+
+Invite-link creation now also requires active access to the target channel, so
+channel-scoped bans cannot mint new membership tokens.
+
+Special mentions are now explicit: `@channel` notifies eligible channel
+participants, while `@here` snapshots currently present users into durable
+message metadata so notification retries preserve the original online-user
+scope. Unit and integration validation cover special-scope parsing and the
+existing mention delivery path.
+The composer now offers both special scopes alongside user suggestions.
+The integration flow also sends an `@channel` message and verifies mention
+notification delivery to another eligible public-channel participant.
+
+Outbox and external-notification workers now log claim, acknowledgement, and
+retry-release database failures instead of silently continuing. This preserves
+retry semantics while making queue degradation visible across HA replicas.
+Rust formatting, Clippy, and all backend tests pass after the worker hardening.
+
+CI now executes a disposable two-user, one-second read-only capacity smoke
+against PostgreSQL and Valkey-backed backend services, validates the benchmark
+JSON pass verdict and authenticated-client count, and cleans up the server.
+This adds executable load-path coverage while keeping the full-scale benchmark
+operator-controlled.
+
+Final repository validation: Rust formatting, Clippy, 42 backend unit tests, and
+2 dependency integration test targets pass (the targets are environment-gated
+and skip when local service URLs are absent); frontend type checks, 16 tests, and the
+production build pass; all shell/Python checks, terminology hygiene, and diff
+hygiene pass; Helm lint passes and a values-backed render contains the HA,
+security, disruption-budget, and network-policy resources. Live Docker and
+Kubernetes failure drills remain CI/operator checks because those runtimes are
+not available in this execution environment.

@@ -3,15 +3,7 @@ use super::*;
 pub(crate) async fn admin_users(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<AdminListQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    admin_users_query(state, headers, query).await
-}
-
-pub(crate) async fn admin_users_query(
-    state: Arc<AppState>,
-    headers: HeaderMap,
-    query: AdminListQuery,
+    Query(query): Query<UserListQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     require_permission(&session.user, "users:read")?;
@@ -50,7 +42,7 @@ pub(crate) async fn admin_users_query(
 pub(crate) async fn admin_disable_user(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    axum::extract::Path(user): axum::extract::Path<Uuid>,
+    Path(user): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     require_csrf(&headers, &session)?;
@@ -65,7 +57,7 @@ pub(crate) async fn admin_disable_user(
 pub(crate) async fn admin_enable_user(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    axum::extract::Path(user): axum::extract::Path<Uuid>,
+    Path(user): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     require_csrf(&headers, &session)?;
@@ -80,7 +72,7 @@ pub(crate) async fn admin_enable_user(
 pub(crate) async fn admin_delete_user(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    axum::extract::Path(user): axum::extract::Path<Uuid>,
+    Path(user): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     require_csrf(&headers, &session)?;
@@ -88,13 +80,25 @@ pub(crate) async fn admin_delete_user(
     if user == session.user.id {
         return Err(AppError::bad_request("you cannot delete your own account"));
     }
+    let now = state.clock.now_millis() as i64;
     let mut tx = state.database.begin().await?;
-    let result = sqlx::query("UPDATE users SET deleted_at=COALESCE(deleted_at,$1), disabled_at=COALESCE(disabled_at,$1), role_version=role_version+1, updated_at=$1 WHERE id=$2 AND deleted_at IS NULL").bind(now_millis() as i64).bind(user).execute(&mut *tx).await?;
+    let result = sqlx::query("UPDATE users SET deleted_at=COALESCE(deleted_at,$1), disabled_at=COALESCE(disabled_at,$1), role_version=role_version+1, updated_at=$1 WHERE id=$2 AND deleted_at IS NULL").bind(now).bind(user).execute(&mut *tx).await?;
     if result.rows_affected() == 0 {
         return Err(RepositoryError::NotFound.into());
     }
-    sqlx::query("INSERT INTO audit_events (id,actor_user_id,action,target_type,target_id,created_at) VALUES ($1,$2,'user.deleted','user',$3,$4)").bind(Uuid::now_v7()).bind(session.user.id).bind(user).bind(now_millis() as i64).execute(&mut *tx).await?;
-    sqlx::query("INSERT INTO outbox_events (id,topic,payload,created_at) VALUES ($1,'auth.invalidate',jsonb_build_object('user_id',$2::text),$3)").bind(Uuid::now_v7()).bind(user).bind(now_millis() as i64).execute(&mut *tx).await?;
+    record_audit(
+        &mut tx,
+        AuditEvent {
+            actor: Some(session.user.id),
+            action: "user.deleted",
+            target_type: "user",
+            target_id: user,
+            metadata: serde_json::json!({}),
+            created_at: now,
+        },
+    )
+    .await?;
+    queue_auth_invalidation(&mut tx, user, now).await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -102,27 +106,39 @@ pub(crate) async fn admin_delete_user(
 pub(crate) async fn admin_reset_password(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    axum::extract::Path(user): axum::extract::Path<Uuid>,
+    Path(user): Path<Uuid>,
     Json(request): Json<PasswordResetRequest>,
 ) -> Result<StatusCode, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     require_csrf(&headers, &session)?;
     require_permission(&session.user, "users:write")?;
     let hash = password_hash(&request.password)?;
+    let now = state.clock.now_millis() as i64;
     let mut tx = state.database.begin().await?;
     let result = sqlx::query(
         "UPDATE users SET password_hash=$1,updated_at=$2 WHERE id=$3 AND deleted_at IS NULL",
     )
     .bind(hash)
-    .bind(now_millis() as i64)
+    .bind(now)
     .bind(user)
     .execute(&mut *tx)
     .await?;
     if result.rows_affected() == 0 {
         return Err(RepositoryError::NotFound.into());
     }
-    sqlx::query("INSERT INTO audit_events (id,actor_user_id,action,target_type,target_id,created_at) VALUES ($1,$2,'user.password_reset','user',$3,$4)").bind(Uuid::now_v7()).bind(session.user.id).bind(user).bind(now_millis() as i64).execute(&mut *tx).await?;
-    sqlx::query("INSERT INTO outbox_events (id,topic,payload,created_at) VALUES ($1,'auth.invalidate',jsonb_build_object('user_id',$2::text),$3)").bind(Uuid::now_v7()).bind(user).bind(now_millis() as i64).execute(&mut *tx).await?;
+    record_audit(
+        &mut tx,
+        AuditEvent {
+            actor: Some(session.user.id),
+            action: "user.password_reset",
+            target_type: "user",
+            target_id: user,
+            metadata: serde_json::json!({}),
+            created_at: now,
+        },
+    )
+    .await?;
+    queue_auth_invalidation(&mut tx, user, now).await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -130,14 +146,26 @@ pub(crate) async fn admin_reset_password(
 pub(crate) async fn admin_invalidate_sessions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    axum::extract::Path(user): axum::extract::Path<Uuid>,
+    Path(user): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     require_csrf(&headers, &session)?;
     require_permission(&session.user, "users:write")?;
+    let now = state.clock.now_millis() as i64;
     let mut tx = state.database.begin().await?;
-    sqlx::query("INSERT INTO audit_events (id,actor_user_id,action,target_type,target_id,created_at) VALUES ($1,$2,'user.sessions_invalidated','user',$3,$4)").bind(Uuid::now_v7()).bind(session.user.id).bind(user).bind(now_millis() as i64).execute(&mut *tx).await?;
-    sqlx::query("INSERT INTO outbox_events (id,topic,payload,created_at) VALUES ($1,'auth.invalidate',jsonb_build_object('user_id',$2::text),$3)").bind(Uuid::now_v7()).bind(user).bind(now_millis() as i64).execute(&mut *tx).await?;
+    record_audit(
+        &mut tx,
+        AuditEvent {
+            actor: Some(session.user.id),
+            action: "user.sessions_invalidated",
+            target_type: "user",
+            target_id: user,
+            metadata: serde_json::json!({}),
+            created_at: now,
+        },
+    )
+    .await?;
+    queue_auth_invalidation(&mut tx, user, now).await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -172,7 +200,7 @@ pub(crate) async fn admin_permissions(
 pub(crate) async fn admin_participants(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    axum::extract::Path(channel): axum::extract::Path<String>,
+    Path(channel): Path<String>,
 ) -> Result<Json<Vec<Participant>>, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     require_permission(&session.user, "users:read")?;
@@ -196,7 +224,7 @@ pub(crate) async fn admin_operations(
     let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE disabled_at IS NULL")
         .fetch_one(&state.database)
         .await?;
-    let mut connection = valkey_commands()?;
+    let mut connection = state.valkey.connection()?;
     let _: String = redis::cmd("PING").query_async(&mut connection).await?;
     Ok(Json(
         serde_json::json!({"postgres":"ok", "valkey":"ok", "sessions":"valkey", "websockets": ACTIVE_WEBSOCKETS.load(Ordering::Relaxed), "outbox_pending": pending, "notification_deliveries_pending": pending_notifications, "active_users": users, "cache":"valkey"}),
@@ -206,7 +234,7 @@ pub(crate) async fn admin_operations(
 pub(crate) async fn admin_bans(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<AdminListQuery>,
+    Query(query): Query<BanListQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     require_permission(&session.user, "moderation:read")?;
@@ -234,7 +262,7 @@ pub(crate) async fn admin_create_ban(
         return Err(AppError::bad_request("ban reason must be 1–500 characters"));
     }
     if let Some(expires_at) = request.expires_at
-        && expires_at <= now_millis() as i64
+        && expires_at <= state.clock.now_millis() as i64
     {
         return Err(AppError::bad_request("ban expiry must be in the future"));
     }
@@ -260,40 +288,55 @@ pub(crate) async fn admin_create_ban(
         None
     };
     let id = Uuid::now_v7();
-    let now = now_millis() as i64;
+    let now = state.clock.now_millis() as i64;
     sqlx::query("INSERT INTO user_bans (id,user_id,channel_id,reason,created_by,expires_at,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)")
         .bind(id).bind(request.user_id).bind(channel_id).bind(reason).bind(session.user.id).bind(request.expires_at).bind(now).execute(&state.database).await?;
-    sqlx::query("INSERT INTO audit_events (id,actor_user_id,action,target_type,target_id,metadata,created_at) VALUES ($1,$2,'user.banned','user',$3,jsonb_build_object('reason',$4,'channel_id',$5),$6)")
-        .bind(Uuid::now_v7()).bind(session.user.id).bind(request.user_id).bind(reason).bind(channel_id).bind(now).execute(&state.database).await?;
+    record_audit_pool(
+        &state.database,
+        AuditEvent {
+            actor: Some(session.user.id),
+            action: "user.banned",
+            target_type: "user",
+            target_id: request.user_id,
+            metadata: serde_json::json!({"reason": reason, "channel_id": channel_id}),
+            created_at: now,
+        },
+    )
+    .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
 
 pub(crate) async fn admin_revoke_ban(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    axum::extract::Path(id): axum::extract::Path<Uuid>,
+    Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     require_csrf(&headers, &session)?;
     require_permission(&session.user, "moderation:write")?;
+    let now = state.clock.now_millis() as i64;
     let mut tx = state.database.begin().await?;
     let row = sqlx::query(
         "UPDATE user_bans SET revoked_at=$1,revoked_by=$2 WHERE id=$3 AND revoked_at IS NULL RETURNING user_id",
     )
-    .bind(now_millis() as i64)
+    .bind(now)
     .bind(session.user.id)
     .bind(id)
     .fetch_optional(&mut *tx)
     .await?;
     let user_id: Uuid = row.ok_or(RepositoryError::NotFound)?.get("user_id");
-    sqlx::query("INSERT INTO audit_events (id,actor_user_id,action,target_type,target_id,metadata,created_at) VALUES ($1,$2,'user.ban_revoked','user',$3,jsonb_build_object('ban_id',$4),$5)")
-        .bind(Uuid::now_v7())
-        .bind(session.user.id)
-        .bind(user_id)
-        .bind(id)
-        .bind(now_millis() as i64)
-        .execute(&mut *tx)
-        .await?;
+    record_audit(
+        &mut tx,
+        AuditEvent {
+            actor: Some(session.user.id),
+            action: "user.ban_revoked",
+            target_type: "user",
+            target_id: user_id,
+            metadata: serde_json::json!({"ban_id": id}),
+            created_at: now,
+        },
+    )
+    .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -301,7 +344,7 @@ pub(crate) async fn admin_revoke_ban(
 pub(crate) async fn admin_channels(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<AdminListQuery>,
+    Query(query): Query<ChannelListQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     require_permission(&session.user, "channels:read")?;
@@ -332,13 +375,18 @@ pub(crate) async fn admin_create_channel(
         .bind(&name)
         .fetch_one(&state.database)
         .await?;
-    sqlx::query("INSERT INTO audit_events (id,actor_user_id,action,target_type,target_id,created_at) VALUES ($1,$2,'channel.created','channel',$3,$4)")
-        .bind(Uuid::now_v7())
-        .bind(session.user.id)
-        .bind(channel_id)
-        .bind(now_millis() as i64)
-        .execute(&state.database)
-        .await?;
+    record_audit_pool(
+        &state.database,
+        AuditEvent {
+            actor: Some(session.user.id),
+            action: "channel.created",
+            target_type: "channel",
+            target_id: channel_id,
+            metadata: serde_json::json!({}),
+            created_at: state.clock.now_millis() as i64,
+        },
+    )
+    .await?;
     publish_system_message(
         &state,
         &name,
@@ -351,7 +399,7 @@ pub(crate) async fn admin_create_channel(
 pub(crate) async fn admin_update_channel(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    axum::extract::Path(id): axum::extract::Path<Uuid>,
+    Path(id): Path<Uuid>,
     Json(request): Json<ChannelAdminRequest>,
 ) -> Result<StatusCode, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
@@ -376,7 +424,18 @@ pub(crate) async fn admin_update_channel(
     };
     let retention_days = validate_retention_days(request.retention_days)?;
     sqlx::query("UPDATE channels SET name=COALESCE($1,name),description=COALESCE($2,description),retention_days=COALESCE($3,retention_days),posting_restricted=COALESCE($4,posting_restricted) WHERE id=$5").bind(name).bind(request.description).bind(retention_days).bind(request.posting_restricted).bind(id).execute(&mut *tx).await?;
-    sqlx::query("INSERT INTO audit_events (id,actor_user_id,action,target_type,target_id,created_at) VALUES ($1,$2,'channel.updated','channel',$3,$4)").bind(Uuid::now_v7()).bind(session.user.id).bind(id).bind(now_millis() as i64).execute(&mut *tx).await?;
+    record_audit(
+        &mut tx,
+        AuditEvent {
+            actor: Some(session.user.id),
+            action: "channel.updated",
+            target_type: "channel",
+            target_id: id,
+            metadata: serde_json::json!({}),
+            created_at: state.clock.now_millis() as i64,
+        },
+    )
+    .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -393,7 +452,7 @@ fn validate_retention_days(value: Option<i32>) -> Result<Option<i32>, AppError> 
 pub(crate) async fn admin_channel_state(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    axum::extract::Path((id, action)): axum::extract::Path<(Uuid, String)>,
+    Path((id, action)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     require_csrf(&headers, &session)?;
@@ -407,7 +466,7 @@ pub(crate) async fn admin_channel_state(
     if row.get::<String, _>("name") == MAIN_CHANNEL {
         return Err(AppError::bad_request("main cannot be changed"));
     }
-    let now = now_millis() as i64;
+    let now = state.clock.now_millis() as i64;
     let sql = match action.as_str() {
         "archive" => "UPDATE channels SET archived_at=COALESCE(archived_at,$1) WHERE id=$2",
         "restore" => "UPDATE channels SET archived_at=NULL WHERE id=$2",
@@ -420,7 +479,19 @@ pub(crate) async fn admin_channel_state(
         .bind(id)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("INSERT INTO audit_events (id,actor_user_id,action,target_type,target_id,created_at) VALUES ($1,$2,$3,'channel',$4,$5)").bind(Uuid::now_v7()).bind(session.user.id).bind(format!("channel.{action}")).bind(id).bind(now).execute(&mut *tx).await?;
+    let audit_action = format!("channel.{action}");
+    record_audit(
+        &mut tx,
+        AuditEvent {
+            actor: Some(session.user.id),
+            action: &audit_action,
+            target_type: "channel",
+            target_id: id,
+            metadata: serde_json::json!({}),
+            created_at: now,
+        },
+    )
+    .await?;
     tx.commit().await?;
     if matches!(action.as_str(), "archive" | "restore") {
         let message = if action == "archive" {
@@ -436,7 +507,7 @@ pub(crate) async fn admin_channel_state(
 pub(crate) async fn admin_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<AdminListQuery>,
+    Query(query): Query<MessageAdminQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     require_permission(&session.user, "moderation:read")?;
@@ -449,12 +520,13 @@ pub(crate) async fn admin_messages(
 pub(crate) async fn admin_moderate_message(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    axum::extract::Path((id, action)): axum::extract::Path<(Uuid, String)>,
+    Path((id, action)): Path<(Uuid, String)>,
     Json(request): Json<ModerationRequest>,
 ) -> Result<StatusCode, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     require_csrf(&headers, &session)?;
     require_permission(&session.user, "moderation:write")?;
+    let now = state.clock.now_millis() as i64;
     let mut tx = state.database.begin().await?;
     let _row = sqlx::query("SELECT m.channel_id,c.name AS channel FROM messages m JOIN channels c ON c.id=m.channel_id WHERE m.id=$1 FOR UPDATE")
         .bind(id)
@@ -472,7 +544,7 @@ pub(crate) async fn admin_moderate_message(
     };
     if action == "delete" {
         sqlx::query(sql)
-            .bind(now_millis() as i64)
+            .bind(now)
             .bind(session.user.id)
             .bind(request.reason.clone())
             .bind(id)
@@ -481,7 +553,19 @@ pub(crate) async fn admin_moderate_message(
     } else {
         sqlx::query(sql).bind(id).execute(&mut *tx).await?;
     }
-    sqlx::query("INSERT INTO audit_events (id,actor_user_id,action,target_type,target_id,metadata,created_at) VALUES ($1,$2,$3,'message',$4,jsonb_build_object('reason',$5),$6)").bind(Uuid::now_v7()).bind(session.user.id).bind(format!("message.{action}" )).bind(id).bind(request.reason.clone()).bind(now_millis() as i64).execute(&mut *tx).await?;
+    let audit_action = format!("message.{action}");
+    record_audit(
+        &mut tx,
+        AuditEvent {
+            actor: Some(session.user.id),
+            action: &audit_action,
+            target_type: "message",
+            target_id: id,
+            metadata: serde_json::json!({"reason": request.reason}),
+            created_at: now,
+        },
+    )
+    .await?;
     tx.commit().await?;
     refresh_moderated_message(&state, id).await;
     Ok(StatusCode::NO_CONTENT)
@@ -496,40 +580,40 @@ async fn refresh_moderated_message(state: &AppState, id: Uuid) {
         Ok(Some(row)) => row,
         _ => return,
     };
-    let channel: String = row.get("channel");
-    let message = ChatMessage {
-        id: row.get("id"),
-        channel: channel.clone(),
-        username: row.get("username"),
-        text: row.get("text"),
-        created_at: row.get::<i64, _>("created_at") as u64,
-        edited: row.get("edited"),
-        deleted: row.get("deleted"),
-        root_message_id: row.get("root_message_id"),
-        reply_count: row.try_get::<i64, _>("reply_count").unwrap_or_default() as u32,
-        metadata: row
-            .try_get("metadata")
-            .unwrap_or_else(|_| serde_json::json!({})),
-        mentions: row.try_get("mentions").unwrap_or_default(),
-        client_id: row.get("client_id"),
-        file_ids: row.try_get("file_ids").unwrap_or_default(),
+    let message = match ChatMessage::try_from_row(&row) {
+        Ok(message) => message,
+        Err(error) => {
+            tracing::debug!(?error, %id, "moderated message cache refresh skipped");
+            return;
+        }
     };
-    let _ = broadcast(
+    let channel = message.channel.clone();
+    if let Err(error) = broadcast(
         &state.valkey,
         &channel,
         &ServerEvent::MessageUpdated { message },
     )
-    .await;
-    if let Ok(mut connection) = valkey_commands() {
-        let _: redis::RedisResult<usize> = connection.del(history_key(&channel)).await;
-        let _: redis::RedisResult<usize> = connection.del(history_order_key(&channel)).await;
+    .await
+    {
+        tracing::debug!(?error, %id, %channel, "moderated message broadcast failed");
+    }
+    if let Ok(mut connection) = state.valkey.connection() {
+        if let Err(error) = connection.del::<_, usize>(history_key(&channel)).await {
+            tracing::debug!(?error, %channel, "message cache payload invalidation failed");
+        }
+        if let Err(error) = connection
+            .del::<_, usize>(history_order_key(&channel))
+            .await
+        {
+            tracing::debug!(?error, %channel, "message cache ordering invalidation failed");
+        }
     }
 }
 
 pub(crate) async fn admin_message_history(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    axum::extract::Path(id): axum::extract::Path<Uuid>,
+    Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     require_permission(&session.user, "moderation:read")?;
@@ -555,26 +639,31 @@ pub(crate) async fn admin_bulk_moderate(
     }
     let action = request.action;
     let reason = request.reason;
+    let now = state.clock.now_millis() as i64;
     let mut tx = state.database.begin().await?;
     let mut results = Vec::with_capacity(request.ids.len());
     let mut changed_ids = Vec::new();
     for id in request.ids {
         let result = if action == "delete" {
-            sqlx::query("UPDATE messages SET deleted_at=$1,deleted_by=$2,deletion_reason=$3 WHERE id=$4 AND deleted_at IS NULL").bind(now_millis() as i64).bind(session.user.id).bind(reason.clone()).bind(id).execute(&mut *tx).await?
+            sqlx::query("UPDATE messages SET deleted_at=$1,deleted_by=$2,deletion_reason=$3 WHERE id=$4 AND deleted_at IS NULL").bind(now).bind(session.user.id).bind(reason.clone()).bind(id).execute(&mut *tx).await?
         } else {
             sqlx::query("UPDATE messages SET deleted_at=NULL,deleted_by=NULL,deletion_reason=NULL WHERE id=$1 AND deleted_at IS NOT NULL").bind(id).execute(&mut *tx).await?
         };
         results.push(serde_json::json!({"id": id, "updated": result.rows_affected() > 0}));
         if result.rows_affected() > 0 {
-            sqlx::query("INSERT INTO audit_events (id,actor_user_id,action,target_type,target_id,metadata,created_at) VALUES ($1,$2,$3,'message',$4,jsonb_build_object('reason',$5,'bulk',true),$6)")
-                .bind(Uuid::now_v7())
-                .bind(session.user.id)
-                .bind(format!("message.{action}"))
-                .bind(id)
-                .bind(reason.clone())
-                .bind(now_millis() as i64)
-                .execute(&mut *tx)
-                .await?;
+            let audit_action = format!("message.{action}");
+            record_audit(
+                &mut tx,
+                AuditEvent {
+                    actor: Some(session.user.id),
+                    action: &audit_action,
+                    target_type: "message",
+                    target_id: id,
+                    metadata: serde_json::json!({"reason": reason, "bulk": true}),
+                    created_at: now,
+                },
+            )
+            .await?;
             changed_ids.push(id);
         }
     }
@@ -588,7 +677,7 @@ pub(crate) async fn admin_bulk_moderate(
 pub(crate) async fn admin_assign_role(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    axum::extract::Path((user, role)): axum::extract::Path<(Uuid, String)>,
+    Path((user, role)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     require_csrf(&headers, &session)?;
@@ -603,11 +692,12 @@ pub(crate) async fn admin_assign_role(
 pub(crate) async fn admin_remove_role(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    axum::extract::Path((user, role)): axum::extract::Path<(Uuid, String)>,
+    Path((user, role)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     require_csrf(&headers, &session)?;
     require_permission(&session.user, "roles:write")?;
+    let now = state.clock.now_millis() as i64;
     let mut tx = state.database.begin().await?;
     if role == "admin" {
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM user_roles ur JOIN roles r ON r.id=ur.role_id JOIN users u ON u.id=ur.user_id WHERE r.name='admin' AND u.deleted_at IS NULL AND u.disabled_at IS NULL").fetch_one(&mut *tx).await?;
@@ -622,12 +712,23 @@ pub(crate) async fn admin_remove_role(
         return Err(RepositoryError::NotFound.into());
     }
     sqlx::query("UPDATE users SET role_version=role_version+1,updated_at=$1 WHERE id=$2")
-        .bind(now_millis() as i64)
+        .bind(now)
         .bind(user)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("INSERT INTO audit_events (id,actor_user_id,action,target_type,target_id,metadata,created_at) VALUES ($1,$2,'user.role_removed','user',$3,jsonb_build_object('role',$4),$5)").bind(Uuid::now_v7()).bind(session.user.id).bind(user).bind(&role).bind(now_millis() as i64).execute(&mut *tx).await?;
-    sqlx::query("INSERT INTO outbox_events (id,topic,payload,created_at) VALUES ($1,'auth.invalidate',jsonb_build_object('user_id',$2::text),$3)").bind(Uuid::now_v7()).bind(user).bind(now_millis() as i64).execute(&mut *tx).await?;
+    record_audit(
+        &mut tx,
+        AuditEvent {
+            actor: Some(session.user.id),
+            action: "user.role_removed",
+            target_type: "user",
+            target_id: user,
+            metadata: serde_json::json!({"role": role}),
+            created_at: now,
+        },
+    )
+    .await?;
+    queue_auth_invalidation(&mut tx, user, now).await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -635,7 +736,7 @@ pub(crate) async fn admin_remove_role(
 pub(crate) async fn admin_audit(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<AdminListQuery>,
+    Query(query): Query<AuditListQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     require_permission(&session.user, "audit:read")?;

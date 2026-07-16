@@ -72,7 +72,7 @@ pub(crate) async fn request_recovery(
         "chat:rate:recovery:{}",
         hex::encode(Sha256::digest(email.as_bytes()))
     );
-    enforce_rate_limit(&key, 5, 3600).await?;
+    enforce_rate_limit(&state.valkey, &key, 5, 3600).await?;
     let generic = || {
         Json(
             serde_json::json!({"message": "If the account exists, recovery instructions will be sent."}),
@@ -145,18 +145,19 @@ pub(crate) async fn reset_recovery(
         .bind(recovery_token_hash(token))
         .execute(&mut *tx)
         .await?;
-    sqlx::query("INSERT INTO audit_events (id,actor_user_id,action,target_type,target_id,created_at) VALUES ($1,$2,'user.password_recovered','user',$2,$3)")
-        .bind(Uuid::now_v7())
-        .bind(user_id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("INSERT INTO outbox_events (id,topic,payload,created_at) VALUES ($1,'auth.invalidate',jsonb_build_object('user_id',$2::text),$3)")
-        .bind(Uuid::now_v7())
-        .bind(user_id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+    record_audit(
+        &mut tx,
+        AuditEvent {
+            actor: Some(user_id),
+            action: "user.password_recovered",
+            target_type: "user",
+            target_id: user_id,
+            metadata: serde_json::json!({}),
+            created_at: now,
+        },
+    )
+    .await?;
+    queue_auth_invalidation(&mut tx, user_id, now).await?;
     tx.commit().await?;
     Ok(Json(
         serde_json::json!({"message": "password reset successfully"}),
@@ -169,7 +170,7 @@ pub(crate) async fn logout(
 ) -> Result<StatusCode, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     require_csrf(&headers, &session)?;
-    let mut connection = valkey_commands()?;
+    let mut connection = state.valkey.connection()?;
     let _: usize = connection.del(session_key(session.id)).await?;
     let _: usize = connection
         .srem(
@@ -211,7 +212,7 @@ pub(crate) async fn update_account(
     };
     let serialized = serde_json::to_string(&user)
         .map_err(|_| AppError::bad_request("could not update session"))?;
-    let mut connection = valkey_commands()?;
+    let mut connection = state.valkey.connection()?;
     let _: usize = connection
         .hset(session_key(session.id), "user", serialized)
         .await?;
@@ -250,14 +251,24 @@ pub(crate) async fn delete_account(
 ) -> Result<StatusCode, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     require_csrf(&headers, &session)?;
-    let now = now_millis() as i64;
+    let now = state.clock.now_millis() as i64;
     let mut tx = state.database.begin().await?;
     sqlx::query("UPDATE users SET deleted_at=$1,disabled_at=$1,role_version=role_version+1,updated_at=$1 WHERE id=$2 AND deleted_at IS NULL")
         .bind(now).bind(session.user.id).execute(&mut *tx).await?;
-    sqlx::query("INSERT INTO audit_events (id,actor_user_id,action,target_type,target_id,created_at) VALUES ($1,$2,'user.self_deleted','user',$2,$3)")
-        .bind(Uuid::now_v7()).bind(session.user.id).bind(now).execute(&mut *tx).await?;
+    record_audit(
+        &mut tx,
+        AuditEvent {
+            actor: Some(session.user.id),
+            action: "user.self_deleted",
+            target_type: "user",
+            target_id: session.user.id,
+            metadata: serde_json::json!({}),
+            created_at: now,
+        },
+    )
+    .await?;
     tx.commit().await?;
-    let mut connection = valkey_commands()?;
+    let mut connection = state.valkey.connection()?;
     let sessions_key = format!("vussa:user_sessions:{}", session.user.id);
     let ids: Vec<String> = connection.smembers(&sessions_key).await?;
     for id in ids {
@@ -295,10 +306,10 @@ pub(crate) async fn change_password(
         return Err(AppError::unauthorized("current password is incorrect"));
     }
     let hash = password_hash(&request.new_password)?;
-    let now = now_millis() as i64;
+    let now = state.clock.now_millis() as i64;
     sqlx::query("UPDATE users SET password_hash=$1,updated_at=$2,role_version=role_version+1 WHERE id=$3 AND deleted_at IS NULL")
         .bind(hash).bind(now).bind(session.user.id).execute(&state.database).await?;
-    let mut connection = valkey_commands()?;
+    let mut connection = state.valkey.connection()?;
     let sessions_key = format!("vussa:user_sessions:{}", session.user.id);
     let sessions: Vec<String> = connection.smembers(&sessions_key).await?;
     for id in sessions {
@@ -310,8 +321,18 @@ pub(crate) async fn change_password(
             let _: usize = connection.srem(&sessions_key, id).await?;
         }
     }
-    sqlx::query("INSERT INTO audit_events (id,actor_user_id,action,target_type,target_id,created_at) VALUES ($1,$2,'user.password_changed','user',$2,$3)")
-        .bind(Uuid::now_v7()).bind(session.user.id).bind(now).execute(&state.database).await?;
+    record_audit_pool(
+        &state.database,
+        AuditEvent {
+            actor: Some(session.user.id),
+            action: "user.password_changed",
+            target_type: "user",
+            target_id: session.user.id,
+            metadata: serde_json::json!({}),
+            created_at: now,
+        },
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -320,7 +341,7 @@ pub(crate) async fn list_sessions(
     headers: HeaderMap,
 ) -> Result<Json<Vec<SessionView>>, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
-    let mut connection = valkey_commands()?;
+    let mut connection = state.valkey.connection()?;
     let ids: Vec<String> = connection
         .smembers(format!("vussa:user_sessions:{}", session.user.id))
         .await?;
@@ -352,7 +373,7 @@ pub(crate) async fn revoke_session(
             "use logout to revoke the current session",
         ));
     }
-    let mut connection = valkey_commands()?;
+    let mut connection = state.valkey.connection()?;
     let _: usize = connection.del(session_key(id)).await?;
     let _: usize = connection
         .srem(

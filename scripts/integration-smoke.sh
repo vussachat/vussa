@@ -41,7 +41,9 @@ curl --fail --silent --show-error -b "$tmp/cookies" -H "x-csrf-token: $csrf" \
   -d "{\"name\":\"$public_channel_name\"}" | grep -q "$public_channel_name"
 curl --fail --silent --show-error -b "$tmp/cookies" "$base_url/api/v1/channels" | grep -q "$public_channel_name"
 curl --fail --silent --show-error -b "$tmp/cookies" "$base_url/api/v1/unread" >/dev/null
-curl --fail --silent --show-error -b "$tmp/cookies" "$base_url/api/v1/metrics" >/dev/null
+metrics_payload="$(curl --fail --silent --show-error -b "$tmp/cookies" "$base_url/api/v1/metrics")"
+printf '%s' "$metrics_payload" | grep -q 'vussa_active_websockets'
+printf '%s' "$metrics_payload" | grep -q 'vussa_outbox_pending'
 curl --fail --silent --show-error -b "$tmp/cookies" "$base_url/api/v1/notifications/config" | grep -q 'vapid_public_key'
 curl --fail --silent --show-error -b "$tmp/cookies" "$base_url/api/v1/favorites" >/dev/null
 curl --fail --silent --show-error -b "$tmp/cookies" "$base_url/api/v1/messages/saved" >/dev/null
@@ -63,7 +65,10 @@ upload_response="$(curl --fail --silent --show-error -b "$tmp/cookies" -H "x-csr
   -F "file=@$tmp/attachment.txt;type=text/plain" "$base_url/api/v1/files")"
 file_id="$(printf '%s' "$upload_response" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')"
 test -n "$file_id"
-curl --fail --silent --show-error -b "$tmp/cookies" "$base_url/api/v1/files/$file_id" >"$tmp/downloaded.txt"
+curl --fail --silent --show-error -D "$tmp/download.headers" -b "$tmp/cookies" \
+  "$base_url/api/v1/files/$file_id" >"$tmp/downloaded.txt"
+grep -qi "content-disposition: attachment; filename=\"attachment.txt\"; filename\*=UTF-8''attachment.txt" "$tmp/download.headers"
+grep -qi 'content-length: 25' "$tmp/download.headers"
 cmp "$tmp/attachment.txt" "$tmp/downloaded.txt"
 other_email="other-${RANDOM}@example.com"
 other_username="other${RANDOM}"

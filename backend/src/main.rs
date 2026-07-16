@@ -23,7 +23,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex as TokioMutex, Semaphore, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Mutex as TokioMutex, Semaphore, mpsc, oneshot, watch};
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -39,15 +39,17 @@ mod metrics;
 mod models;
 mod notifications;
 mod outbox;
+mod persistence;
 mod repository;
 mod routes;
+mod services;
 mod state;
 mod storage;
 mod websocket;
 
 use api::*;
 use auth::*;
-use cache::{CacheHealth, RedisCacheHealth, VALKEY_COMMAND_INDEX, VALKEY_COMMANDS};
+use cache::{CacheHealth, RedisCacheHealth, ValkeyPool};
 use clock::{Clock, SystemClock};
 use config::*;
 use database::{DatabaseHealth, PostgresDatabaseHealth};
@@ -57,7 +59,9 @@ use models::*;
 use notifications::{
     DisabledNotificationSink, NotificationSink, WebhookNotificationSink, run_notification_delivery,
 };
+use persistence::{AuditEvent, queue_auth_invalidation, record_audit, record_audit_pool};
 use repository::{ChatRepository, PostgresRepository};
+use services::*;
 use state::{AppState, VerificationKey, VerificationOutcome};
 use storage::{
     BlobStore, FileScanner, FilesystemBlobStore, HttpFileScanner, NoopFileScanner, ScanError,
@@ -87,12 +91,20 @@ mod tests {
 
     #[test]
     fn preview_metadata_extractors_are_bounded() {
-        let html = r#"<title>Hello</title><meta name="description" content="A page">"#;
-        assert_eq!(html_tag_value(html, "title").as_deref(), Some("Hello"));
+        let html = r#"<title>Hello &amp; friends</title><meta name="description" content="A page"><meta property="og:image" content="/image.png">"#;
+        let base = reqwest::Url::parse("https://example.test/page").unwrap();
+        let metadata = preview_metadata(html, &base);
+        assert_eq!(metadata.title.as_deref(), Some("Hello & friends"));
+        assert_eq!(metadata.description.as_deref(), Some("A page"));
         assert_eq!(
-            html_meta_value(html, "description").as_deref(),
-            Some("A page")
+            metadata.image_url.as_deref(),
+            Some("https://example.test/image.png")
         );
+        let unsafe_image = preview_metadata(
+            r#"<meta property="og:image" content="javascript:alert(1)">"#,
+            &base,
+        );
+        assert!(unsafe_image.image_url.is_none());
     }
 
     #[test]

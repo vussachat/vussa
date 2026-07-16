@@ -136,6 +136,45 @@ pub(crate) struct ChatMessage {
     pub(crate) file_ids: Vec<Uuid>,
 }
 
+impl ChatMessage {
+    pub(crate) fn try_from_row(row: &sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row;
+
+        let created_at = row.try_get::<i64, _>("created_at")?;
+        let reply_count = row.try_get::<i64, _>("reply_count")?;
+        Ok(Self {
+            id: row.try_get("id")?,
+            channel: row.try_get("channel")?,
+            username: row.try_get("username")?,
+            text: row.try_get("text")?,
+            created_at: checked_unsigned(created_at, "created_at")?,
+            edited: row.try_get("edited")?,
+            deleted: row.try_get("deleted")?,
+            root_message_id: row.try_get("root_message_id")?,
+            reply_count: checked_unsigned(reply_count, "reply_count")?,
+            metadata: row.try_get("metadata")?,
+            mentions: row.try_get("mentions")?,
+            client_id: row.try_get("client_id")?,
+            file_ids: row.try_get("file_ids")?,
+        })
+    }
+}
+
+fn checked_unsigned<T>(value: i64, field: &'static str) -> Result<T, sqlx::Error>
+where
+    T: TryFrom<i64>,
+{
+    value.try_into().map_err(|_| {
+        sqlx::Error::Decode(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{field} cannot be negative or out of range"),
+            )
+            .into(),
+        )
+    })
+}
+
 #[derive(Debug, bitcode::Encode, bitcode::Decode, Clone)]
 pub(crate) struct StoredMessage {
     pub(crate) id: Uuid,

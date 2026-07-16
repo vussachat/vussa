@@ -25,4 +25,28 @@ spec:
           annotations:
             summary: WebSocket connection volume is high
             description: Review capacity and autoscaling before connection saturation.
+        - alert: {{ include "vussa.fullname" . }}HttpErrorRate
+          expr: sum(rate(vussa_http_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(vussa_http_requests_total[5m])), 1) > 0.05
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Backend HTTP error rate is elevated
+            description: More than five percent of backend requests are returning server errors.
+        - alert: {{ include "vussa.fullname" . }}OutboxBacklog
+          expr: sum(vussa_outbox_pending) > 1000
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Durable event backlog is growing
+            description: Outbox processing is not keeping pace with writes.
+        - alert: {{ include "vussa.fullname" . }}NotificationBacklog
+          expr: sum(vussa_notification_deliveries_pending) > 1000
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Notification delivery backlog is growing
+            description: Notification workers are not keeping pace with queued deliveries.
 {{- end }}

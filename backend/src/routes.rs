@@ -1,5 +1,5 @@
 use super::*;
-use axum::{Router, http::HeaderValue, routing::get};
+use axum::{Router, http::HeaderValue, middleware, routing::get};
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
@@ -200,7 +200,8 @@ pub(crate) fn build(state: Arc<AppState>) -> Router {
                     "/invite-links/{token}/accept",
                     axum::routing::post(accept_invite_link),
                 )
-                .route("/ws", get(websocket)),
+                .route("/ws", get(websocket))
+                .layer(middleware::from_fn(metrics::track_http_request)),
         )
         .layer(cors)
         .layer(TraceLayer::new_for_http())
