@@ -408,20 +408,21 @@ pub(crate) async fn list_sessions(
 ) -> Result<Json<Vec<SessionView>>, AppError> {
     let session = load_session(&headers, &state.valkey).await?;
     let mut connection = state.valkey.connection()?;
-    let ids: Vec<String> = connection
-        .smembers(format!("vussa:user_sessions:{}", session.user.id))
-        .await?;
+    let sessions_key = format!("vussa:user_sessions:{}", session.user.id);
+    let ids: Vec<String> = connection.smembers(&sessions_key).await?;
     let mut result = Vec::new();
     for id in ids {
-        let Ok(id) = Uuid::parse_str(&id) else {
+        let Ok(parsed_id) = Uuid::parse_str(&id) else {
             continue;
         };
-        let exists: bool = connection.exists(session_key(id)).await?;
+        let exists: bool = connection.exists(session_key(parsed_id)).await?;
         if exists {
             result.push(SessionView {
-                id,
-                current: id == session.id,
+                id: parsed_id,
+                current: parsed_id == session.id,
             });
+        } else {
+            let _: usize = connection.srem(&sessions_key, &id).await?;
         }
     }
     Ok(Json(result))

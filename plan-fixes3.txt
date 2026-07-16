@@ -1,0 +1,87 @@
+==============================================================================
+  VUSSA BACKEND — RUST CODE AUDIT: ADDITIONAL BUGS & SECURITY ISSUES
+  Generated from deep architectural review of backend/src/** and migrations/**
+==============================================================================
+
+This report details additional security vulnerabilities, reliability concerns,
+memory leaks, and logic bugs discovered in the backend Rust codebase.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 1. SECURITY VULNERABILITIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[SEC-5] DNS Rebinding SSRF Protection Bypass
+  File: `src/api/discovery.rs` (`link_preview` handler)
+  Issue: The `link_preview` handler performs DNS validation using
+         `ensure_public_preview_host(&url)`, which resolves the hostname and
+         validates that the resolved IP address is a public address. However,
+         after the check passes, the handler calls `client.get(url.clone()).send().await`
+         using the original URL (with the hostname). This triggers a second
+         independent DNS resolution by reqwest. An attacker can use DNS rebinding
+         to return a public IP on the first resolution (passing the check)
+         and a private/local IP on the second resolution, bypassing the SSRF
+         protection entirely.
+  Fix: Configure the `reqwest::Client` with a custom resolver that pins the
+       hostname to the resolved IP address validated in `ensure_public_preview_host`,
+       or rewrite the HTTP request URL to target the resolved IP address directly while
+       passing the original hostname in the `Host` header.
+
+[SEC-6] Potential OOM Denial of Service via Unbounded Multipart Memory Allocation
+  File: `src/api/media.rs` (`upload_file` handler)
+  Issue: The `upload_file` handler reads the incoming file chunk using
+         `field.bytes().await` and only verifies the size constraint
+         (`data.len() > MAX_FILE_BYTES`) *after* the entire payload has been fully
+         read into memory. A malicious client can upload an excessively large
+         stream (e.g., several gigabytes), which will consume all available
+         RAM and crash the server with an Out-of-Memory (OOM) error.
+  Fix: Read the multipart stream in chunks, tracking the size as chunks arrive,
+       and immediately abort the upload if the accumulated bytes exceed the 25 MiB limit.
+
+[SEC-7] CSRF Token Timing Attack Vulnerability
+  File: `src/auth.rs` (`require_csrf` function)
+  Issue: The CSRF token validation uses standard string comparison (`!=`).
+         Because standard string comparisons return early on the first mismatched
+         character, they introduce a timing side-channel that could theoretically
+         allow an attacker to guess the CSRF token character-by-character.
+  Fix: Use a constant-time equality check (e.g., using the `subtle` or `constant_time_eq`
+       crates) to compare CSRF tokens.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 2. LOGIC & RELIABILITY BUGS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[BUG-7] CPU Exhaustion Hot Loop on Broadcast Channel Lag
+  File: `src/websocket/handler.rs` (`handle_socket` loop)
+  Issue: The WebSocket message handler listens to room and control broadcast
+         messages using `Ok(message) = control_rx.recv() =>` and
+         `Ok(message) = room_rx.recv() =>` inside a `tokio::select!` block.
+         If a broadcast channel lags (due to buffer overflow from a slow connection
+         or a massive spike in messages), `recv()` returns `Err(RecvError::Lagged)`.
+         Because this return value does not match the `Ok(...)` pattern, the select
+         branch is skipped, and the select loop immediately re-polls the future.
+         This results in an infinite tight loop that consumes 100% of a CPU core.
+  Fix: Match on the `Result` return value of `recv()` and handle `Err(RecvError::Lagged)`
+       safely by logging/tracing the lag event and continuing the loop.
+
+[BUG-8] Redis Session Set Invalidation Memory Leak
+  File: `src/api/account.rs` (`list_sessions` handler)
+  Issue: When a user session naturally expires via the Redis key TTL, the
+         individual session hash is automatically deleted. However, the session
+         ID remains in the user's sessions set (`vussa:user_sessions:<user_id>`).
+         While `list_sessions` uses `exists()` to filter out expired sessions from the
+         returned response, it never deletes these dead session IDs from the set.
+         Over time, this causes expired session IDs to leak and accumulate in
+         the Redis sets indefinitely.
+  Fix: In `list_sessions`, if `connection.exists(session_key(id))` returns `false`,
+       remove that ID from the `vussa:user_sessions:<user_id>` set using `srem`.
+
+[BUG-9] Outbox Infinite Retry Loop on Failure
+  File: `src/outbox.rs` (`run_outbox` loop)
+  Issue: If an outbox event dispatch fails (due to a database constraint violation,
+         malformed payload, or downstream service issue), the loop sets `claimed_at = NULL`
+         and retries the event. Because the outbox claim query does not filter by
+         the number of `attempts`, a permanently failing event will be claimed and
+         retried every 100 milliseconds indefinitely, wasting CPU and database resources.
+  Fix: Modify the outbox claim query to limit the maximum number of attempts
+       (e.g., `attempts < 5`), and mark permanently failing events as poisoned or
+       move them to a dead-letter state.

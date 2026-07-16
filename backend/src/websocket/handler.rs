@@ -170,11 +170,27 @@ pub(crate) async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, s
                     _ => {}
                 }
             }
-            Ok(message) = control_rx.recv() => {
-                if socket.send(message).await.is_err() { break; }
+            result = control_rx.recv() => {
+                match result {
+                    Ok(message) => {
+                        if socket.send(message).await.is_err() { break; }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(%skipped, "WebSocket control channel lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
             }
-            Ok(message) = room_rx.recv() => {
-                if socket.send(message).await.is_err() { break; }
+            result = room_rx.recv() => {
+                match result {
+                    Ok(message) => {
+                        if socket.send(message).await.is_err() { break; }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(%skipped, "WebSocket room channel lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
             }
             else => break,
         }

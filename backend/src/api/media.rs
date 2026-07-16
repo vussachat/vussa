@@ -209,7 +209,7 @@ pub(crate) async fn upload_file(
     let mut original_name = "upload.bin".to_string();
     let mut content_type = "application/octet-stream".to_string();
     let mut bytes = None;
-    while let Some(field) = multipart
+    while let Some(mut field) = multipart
         .next_field()
         .await
         .map_err(|_| AppError::bad_request("invalid multipart body"))?
@@ -223,14 +223,18 @@ pub(crate) async fn upload_file(
         if let Some(value) = field.content_type() {
             content_type = value.to_string();
         }
-        let data = field
-            .bytes()
+        let mut data = Vec::new();
+        while let Some(chunk) = field
+            .chunk()
             .await
-            .map_err(|_| AppError::bad_request("could not read upload"))?;
-        if data.len() > MAX_FILE_BYTES {
-            return Err(AppError::bad_request("file exceeds the 25 MiB limit"));
+            .map_err(|_| AppError::bad_request("could not read upload"))?
+        {
+            if data.len() + chunk.len() > MAX_FILE_BYTES {
+                return Err(AppError::bad_request("file exceeds the 25 MiB limit"));
+            }
+            data.extend_from_slice(&chunk);
         }
-        bytes = Some(data);
+        bytes = Some(::bytes::Bytes::from(data));
         break;
     }
     let bytes = bytes.ok_or_else(|| AppError::bad_request("multipart field 'file' is required"))?;

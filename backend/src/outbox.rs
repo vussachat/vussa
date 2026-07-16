@@ -33,6 +33,7 @@ async fn claim_events(pool: &PgPool, now: i64) -> Result<Vec<sqlx::postgres::PgR
             SELECT id
             FROM outbox_events
             WHERE published_at IS NULL
+              AND attempts < 5
               AND (claimed_at IS NULL OR claimed_at < $1 - $2)
             ORDER BY created_at, id
             FOR UPDATE SKIP LOCKED

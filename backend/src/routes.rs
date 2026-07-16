@@ -138,7 +138,11 @@ pub(crate) fn build(state: Arc<AppState>) -> Router {
                     "/moderation/reports/{id}/{action}",
                     axum::routing::post(update_message_report),
                 )
-                .route("/files", axum::routing::post(upload_file))
+                .route(
+                    "/files",
+                    axum::routing::post(upload_file)
+                        .layer(axum::extract::DefaultBodyLimit::max(MAX_FILE_BYTES)),
+                )
                 .route("/files/{id}", get(download_file))
                 .route("/notifications", get(list_notifications))
                 .route(

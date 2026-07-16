@@ -225,14 +225,29 @@ pub(crate) async fn load_session(
 }
 
 pub(crate) fn require_csrf(headers: &HeaderMap, session: &Session) -> Result<(), AppError> {
-    if headers
+    let header_val = headers
         .get(CSRF_HEADER)
-        .and_then(|value| value.to_str().ok())
-        != Some(session.csrf.as_str())
-    {
+        .and_then(|value| value.to_str().ok());
+    let Some(header_str) = header_val else {
+        return Err(AppError::bad_request("invalid csrf token"));
+    };
+    if !constant_time_compare(header_str, &session.csrf) {
         return Err(AppError::bad_request("invalid csrf token"));
     }
     Ok(())
+}
+
+fn constant_time_compare(a: &str, b: &str) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    if a_bytes.len() != b_bytes.len() {
+        return false;
+    }
+    let mut result = 0u8;
+    for (x, y) in a_bytes.iter().zip(b_bytes.iter()) {
+        result |= x ^ y;
+    }
+    result == 0
 }
 
 pub(crate) fn require_permission(user: &AuthUser, permission: &str) -> Result<(), AppError> {
